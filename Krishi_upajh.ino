@@ -295,7 +295,7 @@ String webpage = R"====(
     <!-- ==================================================== -->
      <script>
       setInterval(function () {
-        fetch("/button")
+        fetch("/moisture")
           .then((r) => r.text())
           .then((data) => {
             document.getElementById("moisture").innerHTML = data;
@@ -315,9 +315,9 @@ void handleRoot() {
 }
 
 void handleButton() {
-  int state = digitalRead(BUTTON);
-  if (state == LOW) server.send(200, "text/plain", "0");
-  else server.send(200, "text/plain", "1");
+  int a = analogRead(A0);
+  a = map(a, 300, 900, 100, 0);
+  server.send(200, "text/plain", (String)a);
 }
 
 void handleLED() {
@@ -342,7 +342,7 @@ void setup() {
   Serial.println(WiFi.localIP());
 
   server.on("/", handleRoot);
-  server.on("/button", handleButton);
+  server.on("/moisture", handleButton);
   server.on("/led", handleLED);
 
   server.begin();
