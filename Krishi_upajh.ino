@@ -1,37 +1,65 @@
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
 
+const char* ssid = "S23";
+const char* password = "passward";
+
 ESP8266WebServer server(80);
 
-/* ---------- First Page ---------- */
-void page1() {
-  
-  String html = "<html><body>"
-                "<h2>Hello</h2>"
-                "<a href='/bye'>Go to Second Page</a>"
-                "</body></html>";
+#define BUTTON D3   // GPIO0
 
-  server.send(200, "text/html", html);
+// ===== HTML page =====
+String webpage = R"====(
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IOT</title>
+<style>
+h1{text-align:center;}
+.display{background:orange;padding:15px;border-radius:10px;width:120px;margin:auto;text-align:center;font-size:30px;}
+</style>
+</head>
+
+<body>
+<h1>Prince IOT</h1>
+<div class="display" id="val">1</div>
+
+<script>
+setInterval(function(){
+  fetch("/button").then(r => r.text()).then(data=>{
+    document.getElementById("val").innerHTML = data;
+  });
+},30);
+</script>
+
+</body>
+</html>
+)====";
+
+// ===== handlers =====
+void handleRoot() {
+  server.send(200, "text/html", webpage);
 }
 
-/* ---------- Second Page ---------- */
-void page2() {
-  String html = "<html><body>"
-                "<h2>Bye</h2>"
-                "<a href='/'>Back to First Page</a>"
-                "</body></html>";
-
-  server.send(200, "text/html", html);
+void handleButton() {
+  int state = digitalRead(BUTTON);
+  if(state == LOW) server.send(200, "text/plain", "0");
+  else server.send(200, "text/plain", "1");
 }
 
 void setup() {
-  Serial.begin(9600);
+  Serial.begin(115200);
 
-  WiFi.softAP("ESP_AP", "12345678");   // AP mode
-  Serial.println(WiFi.softAPIP());     // usually 192.168.4.1
+  pinMode(BUTTON, INPUT_PULLUP);
 
-  server.on("/", page1);      // First page
-  server.on("/bye", page2);   // Second page
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) delay(500);
+
+  Serial.println(WiFi.localIP());
+
+    server.on("/", handleRoot);
+    server.on("/button", handleButton);
 
   server.begin();
 }
