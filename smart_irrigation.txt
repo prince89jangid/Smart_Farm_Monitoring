@@ -1,0 +1,2071 @@
+/*
+ * ============================================================================
+ *  GreenDrip - ESP32 Smart Irrigation Controller
+ * ============================================================================
+ *  Hardware
+ *    Soil moisture sensor (analog) : AO  -> GPIO 34  (ADC1, input only)
+ *                                    VCC -> 3V3,  GND -> GND
+ *    Relay module                  : IN  -> GPIO 26
+ *                                    VCC -> 5V (or 3V3, check your module), GND -> GND
+ *                                    Pump wires through relay COM + NO
+ *    Buzzer (active type)          : (+) -> GPIO 27,  (-) -> GND
+ *
+ *  Logic
+ *    1. Soil moisture is read continuously and shown on the web dashboard.
+ *    2. If moisture <= LOW threshold (Automatic mode): buzzer beeps
+ *       "beep-beep" and the relay (pump) turns ON.
+ *    3. Pump turns OFF when moisture >= HIGH threshold, or after the max-run
+ *       safety time. Buzzer gives one long beep when the pump stops.
+ *    4. Thresholds can be changed from the dashboard (saved in flash).
+ *
+ *  Dashboard (built in - nothing else to upload)
+ *    The full web dashboard is embedded in this file. After uploading:
+ *      1. Open Serial Monitor (115200) and note the IP address.
+ *      2. On a phone/PC connected to the same Wi-Fi open  http://<that IP>
+ *         (or http://esp32.local).
+ *    If the ESP32 cannot join your Wi-Fi it starts its own hotspot
+ *    "GreenDrip-ESP32" (password 12345678) -> open http://192.168.4.1
+ *
+ *  Calibration (no re-flashing needed) - Serial Monitor, 115200 baud:
+ *      d  = save the CURRENT reading as "dry"   (sensor in open air)
+ *      w  = save the CURRENT reading as "wet"   (sensor in a glass of water)
+ *      r  = reset calibration to defaults,   ?  = help
+ *    Do this once, then the moisture % and the thresholds match your sensor.
+ *
+ *  Libraries: only the ESP32 Arduino core (WiFi, WebServer, ESPmDNS,
+ *  Preferences). No extra libraries needed.
+ * ============================================================================
+ */
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include <Preferences.h>
+#include <sys/time.h>
+#include <time.h>
+#include <Wire.h>
+#include <hd44780.h>
+#include <hd44780ioClass/hd44780_I2Cexp.h>
+
+
+void handleRoot();  // serves the embedded dashboard (defined at the bottom)
+
+// ----------------------------- USER CONFIG ---------------------------------
+const char* WIFI_SSID = "Redmi";
+const char* WIFI_PASS = "987654321";
+
+#define SOIL_PIN 34
+#define RELAY_PIN 23
+#define BUZZER_PIN 26
+
+#define RELAY_ACTIVE_LOW true    // most 1-channel relay modules switch ON with LOW
+#define BUZZER_ACTIVE_HIGH true  // active buzzer: HIGH = sound
+
+// Sensor calibration (raw ADC 0..4095). Measure your own sensor:
+//   ADC_DRY = reading with sensor in open air (dry)
+//   ADC_WET = reading with sensor in a glass of water
+// Capacitive sensors read HIGH when dry and LOW when wet.
+int ADC_DRY = 3200;
+int ADC_WET = 1300;
+
+const float PUMP_FLOW_L_PER_MIN = 1.5;  // used only to estimate water volume
+const long GMT_OFFSET_SEC = 19800;      // India (UTC+5:30)
+const char* FIRMWARE_VERSION = "v1.1.0";
+const uint32_t CONFIRM_MS = 2000;  // a threshold must hold this long before the pump switches (ignores spikes)
+
+// ------------------------------ SETTINGS -----------------------------------
+struct Settings {
+  float low = 35;       // start watering at or below (%)
+  float high = 70;      // stop watering at or above (%)
+  int maxRunMin = 10;   // safety cut-off (minutes)
+  int cooldownMin = 2;  // rest time between automatic cycles (minutes)
+} cfg;
+
+bool autoMode = true;  // true = automatic, false = manual
+Preferences prefs;
+WebServer server(80);
+
+// ------------------------------ STATE --------------------------------------
+float moisture = 0;  // smoothed percentage
+int rawValue = 0;    // smoothed raw ADC
+bool pumpOn = false;
+uint32_t sessStartMs = 0;
+uint64_t sessStartEpoch = 0;
+float sessStartMoist = 0;
+bool sessAuto = false;
+uint32_t cooldownUntilMs = 0;
+bool cooldownActive = false;
+bool moistureInit = false;
+uint32_t lowSinceMs = 0, highSinceMs = 0;  // debounce timers for auto start / stop
+bool lowTimerOn = false, highTimerOn = false;
+
+char lastStopReason[16] = "";
+uint64_t lastStopEpoch = 0;
+
+// Moisture history: 1 sample / minute, last 24 h
+#define HIST_SIZE 1440
+struct HistPoint {
+  uint64_t t;
+  float v;
+};
+HistPoint history[HIST_SIZE];
+int histCount = 0, histHead = 0;
+uint32_t lastHistMs = 0;
+
+// Finished irrigation sessions: last 20
+#define SESS_SIZE 20
+struct Session {
+  uint64_t start, end;
+  float durationSec, startMoist, endMoist, waterL;
+  bool isAuto;
+  char reason[16];
+};
+Session sessions[SESS_SIZE];
+int sessCount = 0, sessHead = 0;
+
+// ------------------------------ BUZZER -------------------------------------
+// Non-blocking beep sequencer
+uint8_t beepsLeft = 0;
+uint16_t beepOnMs = 120, beepOffMs = 120;
+bool beepState = false;
+uint32_t beepNextMs = 0;
+
+void buzzerWrite(bool on) {
+  digitalWrite(BUZZER_PIN, (on == BUZZER_ACTIVE_HIGH) ? HIGH : LOW);
+}
+void startBeeps(uint8_t count, uint16_t onMs, uint16_t offMs) {
+  beepsLeft = count;
+  beepOnMs = onMs;
+  beepOffMs = offMs;
+  beepState = false;
+  beepNextMs = millis();
+}
+void updateBuzzer() {
+  if (beepsLeft == 0 && !beepState) return;
+  if ((int32_t)(millis() - beepNextMs) < 0) return;
+  if (!beepState) {  // start a beep
+    buzzerWrite(true);
+    beepState = true;
+    beepNextMs = millis() + beepOnMs;
+  } else {  // end a beep
+    buzzerWrite(false);
+    beepState = false;
+    beepNextMs = millis() + beepOffMs;
+    if (beepsLeft > 0) beepsLeft--;
+  }
+}
+
+
+// ------------------------------ LCD 16x2 (I2C) -----------------------------
+hd44780_I2Cexp lcd;  // I2C address auto-detect
+bool lcdOk = false;
+
+void lcdLine(uint8_t row, const char* s) {
+  char buf[17];
+  snprintf(buf, sizeof(buf), "%-16s", s);  // pad to 16 chars so old text is erased
+  lcd.setCursor(0, row);
+  lcd.print(buf);
+}
+
+void lcdInit() {
+  Wire.begin(21, 22);  // SDA = 21, SCL = 22
+  lcdOk = (lcd.begin(16, 2) == 0);
+  if (!lcdOk) {
+    Serial.println("LCD init failed - check wiring");
+    return;
+  }
+  lcd.backlight();
+  lcd.clear();
+  lcdLine(0, "GreenDrip");
+  lcdLine(1, "Starting...");
+}
+
+void updateLcd() {
+  if (!lcdOk) return;
+  char l1[24], l2[24];
+  snprintf(l1, sizeof(l1), "Moisture: %5.1f%%", moisture);
+  snprintf(l2, sizeof(l2), "Pump:%-3s %s", pumpOn ? "ON" : "OFF", autoMode ? "AUTO" : "MANUAL");
+  lcdLine(0, l1);
+  lcdLine(1, l2);
+}
+
+// ------------------------------ HELPERS ------------------------------------
+uint64_t nowEpochMs() {
+  struct timeval tv;
+  gettimeofday(&tv, nullptr);
+  return (uint64_t)tv.tv_sec * 1000ULL + tv.tv_usec / 1000;
+}
+bool timeSynced() {
+  return time(nullptr) > 1700000000;
+}
+
+void relayWrite(bool on) {
+  digitalWrite(RELAY_PIN, (on == !RELAY_ACTIVE_LOW) ? HIGH : LOW);
+}
+
+void loadSettings() {
+  prefs.begin("greendrip", true);
+  cfg.low = prefs.getFloat("low", 35);
+  cfg.high = prefs.getFloat("high", 70);
+  cfg.maxRunMin = prefs.getInt("maxRun", 10);
+  cfg.cooldownMin = prefs.getInt("cool", 2);
+  autoMode = prefs.getBool("auto", true);
+  ADC_DRY = prefs.getInt("adcDry", ADC_DRY);
+  ADC_WET = prefs.getInt("adcWet", ADC_WET);
+  prefs.end();
+}
+void saveSettings() {
+  prefs.begin("greendrip", false);
+  prefs.putFloat("low", cfg.low);
+  prefs.putFloat("high", cfg.high);
+  prefs.putInt("maxRun", cfg.maxRunMin);
+  prefs.putInt("cool", cfg.cooldownMin);
+  prefs.putBool("auto", autoMode);
+  prefs.end();
+}
+void saveCalibration() {
+  prefs.begin("greendrip", false);
+  prefs.putInt("adcDry", ADC_DRY);
+  prefs.putInt("adcWet", ADC_WET);
+  prefs.end();
+}
+
+// ------------------------------ SENSOR -------------------------------------
+void readSensor() {
+  long sum = 0;
+  for (int i = 0; i < 16; i++) {
+    sum += analogRead(SOIL_PIN);
+    delayMicroseconds(200);
+  }
+  rawValue = sum / 16;
+  int span = ADC_DRY - ADC_WET;
+  float pct = (abs(span) < 50) ? 0.0f : (float)(ADC_DRY - rawValue) * 100.0f / (float)span;
+  pct = constrain(pct, 0.0f, 100.0f);
+  if (!moistureInit) {
+    moisture = pct;
+    moistureInit = true;
+  } else moisture = moisture * 0.7f + pct * 0.3f;  // smooth
+}
+
+// ------------------------------ PUMP CONTROL -------------------------------
+float sessionElapsedSec() {
+  return pumpOn ? (millis() - sessStartMs) / 1000.0f : 0;
+}
+
+// Remaining cool-down in ms (0 = none). Uses a flag, so it stays correct
+// when millis() wraps / after many days of uptime.
+uint32_t cooldownLeftMs() {
+  if (!cooldownActive) return 0;
+  int32_t d = (int32_t)(cooldownUntilMs - millis());
+  if (d <= 0) {
+    cooldownActive = false;
+    return 0;
+  }
+  return (uint32_t)d;
+}
+
+void startPump(bool automatic) {
+  if (pumpOn) return;
+  pumpOn = true;
+  sessAuto = automatic;
+  lowTimerOn = highTimerOn = false;
+  sessStartMs = millis();
+  sessStartEpoch = nowEpochMs();
+  sessStartMoist = moisture;
+  relayWrite(true);
+  startBeeps(2, 150, 150);  // beep-beep
+  Serial.printf("[PUMP] ON (%s) moisture=%.1f%%\n", automatic ? "auto" : "manual", moisture);
+}
+
+void stopPump(const char* reason) {
+  if (!pumpOn) return;
+  float dur = sessionElapsedSec();
+  Session& s = sessions[sessHead];
+  s.start = sessStartEpoch;
+  s.end = nowEpochMs();
+  s.durationSec = dur;
+  s.startMoist = sessStartMoist;
+  s.endMoist = moisture;
+  s.waterL = dur * PUMP_FLOW_L_PER_MIN / 60.0f;
+  s.isAuto = sessAuto;
+  strncpy(s.reason, reason, sizeof(s.reason) - 1);
+  s.reason[sizeof(s.reason) - 1] = 0;
+  sessHead = (sessHead + 1) % SESS_SIZE;
+  if (sessCount < SESS_SIZE) sessCount++;
+
+  pumpOn = false;
+  relayWrite(false);
+  lowTimerOn = highTimerOn = false;
+  strncpy(lastStopReason, reason, sizeof(lastStopReason) - 1);
+  lastStopEpoch = nowEpochMs();
+  cooldownActive = (strcmp(reason, "manual") != 0) && cfg.cooldownMin > 0;
+  cooldownUntilMs = millis() + (uint32_t)cfg.cooldownMin * 60000UL;
+  if (strcmp(reason, "max_runtime") == 0 || strcmp(reason, "overwater") == 0)
+    startBeeps(3, 200, 150);   // alarm: stopped by a safety limit
+  else startBeeps(1, 600, 0);  // one long beep
+  Serial.printf("[PUMP] OFF (%s) after %.0fs, moisture=%.1f%%\n", reason, dur, moisture);
+}
+
+// true once `cond` has been continuously true for CONFIRM_MS
+bool confirmed(bool cond, bool& on, uint32_t& since) {
+  if (!cond) {
+    on = false;
+    return false;
+  }
+  if (!on) {
+    on = true;
+    since = millis();
+    return false;
+  }
+  return (uint32_t)(millis() - since) >= CONFIRM_MS;
+}
+
+void controlLoop() {
+  if (pumpOn) {
+    // safety limits - always active, in every mode
+    if (sessionElapsedSec() >= cfg.maxRunMin * 60.0f) {
+      stopPump("max_runtime");
+      return;
+    }
+    if (moisture >= 95) {
+      stopPump("overwater");
+      return;
+    }
+    lowTimerOn = false;
+    if (confirmed(autoMode && moisture >= cfg.high, highTimerOn, highSinceMs)) stopPump("target_reached");
+  } else {
+    highTimerOn = false;
+    if (confirmed(autoMode && moisture <= cfg.low && cooldownLeftMs() == 0, lowTimerOn, lowSinceMs)) startPump(true);
+  }
+}
+
+void recordHistory() {
+  if (millis() - lastHistMs < 60000UL && histCount > 0) return;
+  if (!timeSynced()) return;
+  lastHistMs = millis();
+  history[histHead] = { nowEpochMs(), moisture };
+  histHead = (histHead + 1) % HIST_SIZE;
+  if (histCount < HIST_SIZE) histCount++;
+}
+
+// ------------------------------ HTTP API -----------------------------------
+void cors() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+  server.sendHeader("Access-Control-Allow-Private-Network", "true");
+  server.sendHeader("Cache-Control", "no-store");
+}
+void sendJson(int code, const String& body) {
+  cors();
+  server.send(code, "application/json", body);
+}
+
+String u64(uint64_t v) {
+  char b[24];
+  snprintf(b, sizeof(b), "%llu", (unsigned long long)v);
+  return String(b);
+}
+
+bool jsonNum(const String& b, const char* key, float& out) {
+  int i = b.indexOf(String("\"") + key + "\"");
+  if (i < 0) return false;
+  i = b.indexOf(':', i);
+  if (i < 0) return false;
+  out = b.substring(i + 1).toFloat();
+  return true;
+}
+bool jsonTrue(const String& b, const char* key) {
+  int i = b.indexOf(String("\"") + key + "\"");
+  if (i < 0) return false;
+  i = b.indexOf(':', i);
+  if (i < 0) return false;
+  String v = b.substring(i + 1);
+  v.trim();
+  return v.startsWith("true");
+}
+
+void handleStatus() {
+  float elapsed = sessionElapsedSec();
+  long cool = (long)((cooldownLeftMs() + 999) / 1000);
+  String j = "{";
+  j += "\"ts\":" + u64(nowEpochMs());
+  j += ",\"moisture\":" + String(moisture, 1);
+  j += ",\"raw\":" + String(rawValue);
+  j += String(",\"pump\":") + (pumpOn ? "true" : "false");
+  j += String(",\"mode\":\"") + (autoMode ? "auto" : "manual") + "\"";
+  j += ",\"cooldownRemainingSec\":" + String(cool);
+  if (pumpOn) {
+    j += ",\"session\":{\"active\":true,\"startedAt\":" + u64(sessStartEpoch);
+    j += ",\"startMoisture\":" + String(sessStartMoist, 1);
+    j += ",\"elapsedSec\":" + String(elapsed, 0);
+    j += ",\"waterL\":" + String(elapsed * PUMP_FLOW_L_PER_MIN / 60.0f, 2);
+    j += String(",\"trigger\":\"") + (sessAuto ? "auto" : "manual") + "\"}";
+  } else {
+    j += ",\"session\":{\"active\":false}";
+  }
+  if (lastStopReason[0]) j += String(",\"lastStop\":{\"reason\":\"") + lastStopReason + "\",\"ts\":" + u64(lastStopEpoch) + "}";
+  else j += ",\"lastStop\":null";
+  j += ",\"device\":{\"ip\":\"" + WiFi.localIP().toString() + "\"";
+  j += ",\"rssi\":" + String(WiFi.RSSI());
+  j += String(",\"firmware\":\"") + FIRMWARE_VERSION + "\"";
+  j += ",\"uptimeSec\":" + String(millis() / 1000) + "}}";
+  sendJson(200, j);
+}
+
+String settingsJson() {
+  return "{\"low\":" + String(cfg.low, 0) + ",\"high\":" + String(cfg.high, 0) + ",\"maxRunMin\":" + String(cfg.maxRunMin) + ",\"cooldownMin\":" + String(cfg.cooldownMin) + "}";
+}
+void handleGetSettings() {
+  sendJson(200, settingsJson());
+}
+
+void handlePostSettings() {
+  String b = server.arg("plain");
+  float v;
+  Settings n = cfg;
+  if (jsonNum(b, "low", v)) n.low = v;
+  if (jsonNum(b, "high", v)) n.high = v;
+  if (jsonNum(b, "maxRunMin", v)) n.maxRunMin = (int)v;
+  if (jsonNum(b, "cooldownMin", v)) n.cooldownMin = (int)v;
+  if (n.low < 0 || n.high > 100 || n.high < n.low + 10 || n.maxRunMin < 1 || n.cooldownMin < 0) {
+    sendJson(400, "{\"error\":\"invalid thresholds (high must be at least low + 10)\"}");
+    return;
+  }
+  cfg = n;
+  saveSettings();
+  Serial.printf("[CFG] low=%.0f high=%.0f maxRun=%d cool=%d\n", cfg.low, cfg.high, cfg.maxRunMin, cfg.cooldownMin);
+  sendJson(200, settingsJson());
+}
+
+void handlePump() {
+  bool on = jsonTrue(server.arg("plain"), "on");
+  if (on) startPump(false);
+  else stopPump("manual");
+  sendJson(200, "{\"ok\":true}");
+}
+void handleMode() {
+  autoMode = server.arg("plain").indexOf("auto") >= 0;
+  saveSettings();
+  Serial.printf("[MODE] %s\n", autoMode ? "auto" : "manual");
+  sendJson(200, "{\"ok\":true}");
+}
+
+void handleHistory() {
+  float rangeMs = 86400000.0f;
+  if (server.hasArg("range")) rangeMs = server.arg("range").toFloat();
+  uint64_t now = nowEpochMs(), from = (rangeMs >= now) ? 0 : now - (uint64_t)rangeMs;
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  cors();
+  server.send(200, "application/json", "");
+  String chunk = "[";
+  bool first = true;
+  int start = (histCount < HIST_SIZE) ? 0 : histHead;
+  for (int i = 0; i < histCount; i++) {
+    HistPoint& p = history[(start + i) % HIST_SIZE];
+    if (p.t < from) continue;
+    if (!first) chunk += ",";
+    chunk += "{\"t\":" + u64(p.t) + ",\"v\":" + String(p.v, 1) + "}";
+    first = false;
+    if (chunk.length() > 900) {
+      server.sendContent(chunk);
+      chunk = "";
+    }
+  }
+  chunk += "]";
+  server.sendContent(chunk);
+  server.sendContent("");
+}
+
+void handleSessions() {
+  int limit = server.hasArg("limit") ? server.arg("limit").toInt() : 20;
+  if (limit < 1 || limit > SESS_SIZE) limit = SESS_SIZE;
+  String j = "[";
+  int out = 0;
+  for (int i = 0; i < sessCount && out < limit; i++) {  // newest first
+    Session& s = sessions[(sessHead - 1 - i + SESS_SIZE) % SESS_SIZE];
+    if (out++) j += ",";
+    j += "{\"id\":" + u64(s.start) + ",\"start\":" + u64(s.start) + ",\"end\":" + u64(s.end);
+    j += ",\"durationSec\":" + String(s.durationSec, 0);
+    j += ",\"startMoisture\":" + String(s.startMoist, 1) + ",\"endMoisture\":" + String(s.endMoist, 1);
+    j += ",\"waterL\":" + String(s.waterL, 2);
+    j += String(",\"trigger\":\"") + (s.isAuto ? "auto" : "manual") + "\",\"reason\":\"" + s.reason + "\"}";
+  }
+  j += "]";
+  sendJson(200, j);
+}
+
+void handleNotFound() {
+  if (server.method() == HTTP_OPTIONS) {
+    cors();
+    server.send(204);
+    return;
+  }  // CORS pre-flight
+  sendJson(404, "{\"error\":\"not found\"}");
+}
+
+// ------------------------------ SERIAL CALIBRATION -------------------------
+void printHelp() {
+  Serial.println("--- Serial commands ---");
+  Serial.println("d = save current reading as DRY (sensor in air)");
+  Serial.println("w = save current reading as WET (sensor in water)");
+  Serial.println("r = reset calibration, ? = this help");
+  Serial.printf("Current calibration: DRY=%d  WET=%d\n", ADC_DRY, ADC_WET);
+}
+void handleSerial() {
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == 'd' || c == 'D') {
+      ADC_DRY = rawValue;
+      saveCalibration();
+      moistureInit = false;
+      Serial.printf("[CAL] DRY saved = %d\n", ADC_DRY);
+    } else if (c == 'w' || c == 'W') {
+      ADC_WET = rawValue;
+      saveCalibration();
+      moistureInit = false;
+      Serial.printf("[CAL] WET saved = %d\n", ADC_WET);
+    } else if (c == 'r' || c == 'R') {
+      ADC_DRY = 3200;
+      ADC_WET = 1300;
+      saveCalibration();
+      moistureInit = false;
+      Serial.println("[CAL] reset to defaults");
+    } else if (c == '?' || c == 'h' || c == 'H') printHelp();
+  }
+}
+
+// ------------------------------ SETUP / LOOP -------------------------------
+void connectWifi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.print("Connecting to WiFi");
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) {
+    delay(400);
+    Serial.print(".");
+  }
+  if (WiFi.status() == WL_CONNECTED) Serial.printf("\nConnected. IP: http://%s\n", WiFi.localIP().toString().c_str());
+  else {
+    Serial.println("\nWiFi failed - starting hotspot 'GreenDrip-ESP32' (password 12345678).");
+    Serial.println("Connect to it and open http://192.168.4.1");
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.softAP("GreenDrip-ESP32", "12345678");
+  }
+  if (lcdOk) {
+    lcdLine(0, "WiFi connected");
+    lcdLine(1, WiFi.localIP().toString().c_str());
+    delay(1500);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(RELAY_PIN, OUTPUT);
+  relayWrite(false);  // pump OFF at boot
+  pinMode(BUZZER_PIN, OUTPUT);
+  buzzerWrite(false);
+  analogReadResolution(12);
+  analogSetPinAttenuation(SOIL_PIN, ADC_11db);  // 0 - ~3.3 V range
+
+  loadSettings();
+  readSensor();  // first reading
+
+
+  lcdInit();  // <-- add this line
+
+
+  connectWifi();
+  configTime(GMT_OFFSET_SEC, 0, "pool.ntp.org", "time.google.com");
+  if (MDNS.begin("esp32")) Serial.println("mDNS: http://esp32.local");
+
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/favicon.ico", HTTP_GET, []() {
+    server.send(204);
+  });
+  server.on("/api/status", HTTP_GET, handleStatus);
+  server.on("/api/settings", HTTP_GET, handleGetSettings);
+  server.on("/api/settings", HTTP_POST, handlePostSettings);
+  server.on("/api/pump", HTTP_POST, handlePump);
+  server.on("/api/mode", HTTP_POST, handleMode);
+  server.on("/api/history", HTTP_GET, handleHistory);
+  server.on("/api/sessions", HTTP_GET, handleSessions);
+  server.onNotFound(handleNotFound);
+  server.begin();
+
+  startBeeps(1, 80, 0);  // short "ready" chirp
+  Serial.println("GreenDrip ready. Open the dashboard in your browser.");
+  printHelp();
+}
+
+void loop() {
+  server.handleClient();
+  handleSerial();
+  updateBuzzer();
+
+  static uint32_t lastRead = 0;
+  if (millis() - lastRead >= 500) {
+    lastRead = millis();
+    readSensor();
+    controlLoop();
+    recordHistory();
+    updateLcd();
+    static uint32_t lastPrint = 0;
+    if (millis() - lastPrint >= 2000) {
+      lastPrint = millis();
+      Serial.printf("raw=%d  moisture=%.1f%%  pump=%s  mode=%s  (start<=%.0f stop>=%.0f)  cooldown=%lus\n",
+                    rawValue, moisture, pumpOn ? "ON" : "OFF", autoMode ? "AUTO" : "MANUAL", cfg.low, cfg.high,
+                    (unsigned long)((cooldownLeftMs() + 999) / 1000));
+    }
+  }
+}
+
+// ============================================================================
+//  EMBEDDED WEB DASHBOARD  (served from flash at "/")
+// ============================================================================
+const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
+<html lang="en" data-theme="light" data-accent="green">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#16a34a">
+<meta name="color-scheme" content="light dark">
+<title>GreenDrip · Smart Irrigation</title>
+<script>
+/* Apply saved theme before first paint to avoid a flash */
+try{
+  const p=JSON.parse(localStorage.getItem('greendrip.prefs')||'{}');
+  const dark=p.theme==='dark'||((!p.theme||p.theme==='system')&&matchMedia('(prefers-color-scheme: dark)').matches);
+  document.documentElement.dataset.theme=dark?'dark':'light';
+  if(p.accent)document.documentElement.dataset.accent=p.accent;
+  if(p.motion==='off')document.documentElement.dataset.motion='off';
+}catch(e){}
+</script>
+<style>
+/* =====================================================================
+   DESIGN TOKENS
+   ===================================================================== */
+:root{
+  --font: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --bg:#eef6f0; --surface:#ffffff; --surface-2:#f3f8f4; --seg-active:#ffffff;
+  --text:#0f2418; --muted:#5a7264; --border:#dcebe0; --track:#e1ede5;
+  --accent:#16a34a; --accent-ink:#15803d; --on-accent:#ffffff;
+  --dry:#f59e0b; --wet:#0ea5e9; --danger:#e11d48;
+  --accent-soft: color-mix(in srgb, var(--accent) 13%, transparent);
+  --shadow: 0 1px 2px rgba(15,36,24,.05), 0 12px 32px -14px rgba(15,36,24,.16);
+  --radius:22px; --nav-h:66px;
+  color-scheme: light;
+}
+html[data-accent=emerald]{--accent:#059669;--accent-ink:#047857}
+html[data-accent=teal]{--accent:#0d9488;--accent-ink:#0f766e}
+html[data-accent=lime]{--accent:#65a30d;--accent-ink:#4d7c0f}
+
+html[data-theme=dark]{
+  --bg:#08130d; --surface:#112018; --surface-2:#0d1a13; --seg-active:#1d3428;
+  --text:#e6f3ea; --muted:#8fa99a; --border:#1f3528; --track:#1c3024;
+  --accent:#22c55e; --accent-ink:#4ade80; --on-accent:#04210f;
+  --dry:#fbbf24; --wet:#38bdf8; --danger:#fb7185;
+  --shadow: 0 1px 2px rgba(0,0,0,.4), 0 16px 36px -16px rgba(0,0,0,.65);
+  color-scheme: dark;
+}
+html[data-theme=dark][data-accent=emerald]{--accent:#10b981;--accent-ink:#34d399}
+html[data-theme=dark][data-accent=teal]{--accent:#14b8a6;--accent-ink:#2dd4bf}
+html[data-theme=dark][data-accent=lime]{--accent:#84cc16;--accent-ink:#a3e635}
+
+/* =====================================================================
+   BASE
+   ===================================================================== */
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%;scroll-behavior:smooth}
+body{
+  margin:0;font-family:var(--font);font-size:15px;line-height:1.45;color:var(--text);
+  background:
+    radial-gradient(900px 520px at 12% -8%, color-mix(in srgb,var(--accent) 16%,transparent), transparent 62%),
+    radial-gradient(700px 480px at 100% 0%, color-mix(in srgb,var(--wet) 9%,transparent), transparent 60%),
+    var(--bg);
+  background-attachment:fixed;
+  padding-bottom:calc(var(--nav-h) + env(safe-area-inset-bottom) + 28px);
+  transition:background-color .3s,color .3s;
+  -webkit-font-smoothing:antialiased;
+}
+[hidden]{display:none!important}
+button{font-family:inherit}
+.container{width:min(1120px, 100% - 32px);margin-inline:auto}
+.ico{width:20px;height:20px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;flex:none}
+.ico.sm{width:16px;height:16px}
+:focus-visible{outline:3px solid color-mix(in srgb,var(--accent) 55%,transparent);outline-offset:2px}
+
+/* =====================================================================
+   HEADER / NAV
+   ===================================================================== */
+.app-header{
+  position:sticky;top:0;z-index:30;padding-top:env(safe-area-inset-top);
+  background:color-mix(in srgb,var(--bg) 80%,transparent);
+  backdrop-filter:saturate(1.4) blur(14px);-webkit-backdrop-filter:saturate(1.4) blur(14px);
+  border-bottom:1px solid color-mix(in srgb,var(--border) 70%,transparent);
+}
+.header-inner{height:60px;display:flex;align-items:center;gap:10px}
+.brand{display:flex;align-items:center;gap:10px;font-weight:800;letter-spacing:-.02em;font-size:17px;line-height:1.1}
+.brand small{display:block;font-weight:500;color:var(--muted);font-size:11px;letter-spacing:0;margin-top:2px}
+.logo{width:38px;height:38px;border-radius:13px;display:grid;place-items:center;color:var(--on-accent);
+  background:linear-gradient(135deg,var(--accent),color-mix(in srgb,var(--accent) 55%,#064e3b));
+  box-shadow:0 8px 18px -8px color-mix(in srgb,var(--accent) 80%,transparent)}
+.badge-demo{font-size:10.5px;font-weight:800;letter-spacing:.08em;padding:3px 8px;border-radius:99px;background:var(--accent-soft);color:var(--accent-ink);border:1px solid color-mix(in srgb,var(--accent) 30%,transparent)}
+.spacer{flex:1}
+.conn{display:inline-flex;align-items:center;gap:8px;padding:7px 12px;border-radius:999px;background:var(--surface);border:1px solid var(--border);font-size:13px;font-weight:700;white-space:nowrap}
+.conn .lat{color:var(--muted);font-weight:600;display:none}
+@media(min-width:460px){.conn .lat{display:inline}}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--muted);position:relative;flex:none}
+.conn[data-state=online] .dot{background:var(--accent)}
+.conn[data-state=offline] .dot{background:var(--danger)}
+.conn[data-state=connecting] .dot{background:var(--dry)}
+.conn[data-state=online] .dot::after,.conn[data-state=connecting] .dot::after{content:"";position:absolute;inset:0;border-radius:50%;background:inherit;animation:ping 1.8s ease-out infinite}
+@keyframes ping{0%{transform:scale(1);opacity:.6}100%{transform:scale(3);opacity:0}}
+.icon-btn{width:40px;height:40px;border-radius:13px;border:1px solid var(--border);background:var(--surface);color:var(--text);display:grid;place-items:center;cursor:pointer;transition:transform .15s,background .2s}
+.icon-btn:active{transform:scale(.92)}
+html[data-theme=dark] .ico-sun,html[data-theme=light] .ico-moon{display:none}
+
+.nav{
+  position:fixed;left:0;right:0;bottom:0;z-index:40;display:flex;gap:4px;
+  padding:8px 12px calc(8px + env(safe-area-inset-bottom));
+  background:color-mix(in srgb,var(--surface) 90%,transparent);
+  backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);border-top:1px solid var(--border);
+}
+.nav button{flex:1;display:flex;flex-direction:column;align-items:center;gap:3px;padding:7px 4px;border:0;background:none;color:var(--muted);font-size:11.5px;font-weight:700;border-radius:15px;cursor:pointer;transition:background .2s,color .2s}
+.nav button[aria-current=page]{color:var(--accent-ink);background:var(--accent-soft)}
+@media(min-width:760px){
+  body{padding-bottom:48px}
+  .nav{position:sticky;top:68px;bottom:auto;width:fit-content;margin:16px auto 0;padding:5px;gap:2px;border:1px solid var(--border);border-radius:999px;background:var(--surface);box-shadow:var(--shadow)}
+  .nav button{flex-direction:row;gap:8px;padding:9px 20px;font-size:14px;border-radius:999px}
+}
+
+/* =====================================================================
+   LAYOUT / CARDS
+   ===================================================================== */
+main{padding-top:18px}
+.view{display:grid;gap:16px;grid-template-columns:minmax(0,1fr)}
+.col{display:grid;gap:16px;align-content:start;grid-template-columns:minmax(0,1fr)}
+@media(min-width:760px){
+  .view.overview{grid-template-columns:repeat(12,minmax(0,1fr))}
+  .c-moist{grid-column:span 5}
+  .c-right{grid-column:span 7}
+  .c-trend{grid-column:span 8}
+  .c-device{grid-column:span 4}
+  .view.two{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .span2{grid-column:1/-1}
+}
+.card{
+  background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:18px;box-shadow:var(--shadow);
+  animation:rise .55s both cubic-bezier(.2,.7,.2,1);animation-delay:calc(var(--i,0)*70ms);
+  transition:background-color .3s,border-color .3s;min-width:0;
+}
+@keyframes rise{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:none}}
+.card-head{display:flex;align-items:center;gap:10px;margin-bottom:14px;flex-wrap:wrap}
+.card-title{font-size:15px;font-weight:800;display:flex;align-items:center;gap:8px;margin:0;letter-spacing:-.01em}
+.card-title .ico{color:var(--accent-ink)}
+.card-sub{margin-left:auto;font-size:12.5px;color:var(--muted);font-weight:600}
+
+.banner{display:flex;gap:10px;align-items:flex-start;margin-bottom:16px;padding:12px 14px;border-radius:16px;
+  background:color-mix(in srgb,var(--danger) 10%,var(--surface));border:1px solid color-mix(in srgb,var(--danger) 35%,transparent);color:var(--text);font-size:14px;animation:rise .4s both}
+.banner .ico{color:var(--danger);margin-top:1px}
+
+/* segmented */
+.seg{display:inline-flex;padding:4px;gap:2px;background:var(--surface-2);border:1px solid var(--border);border-radius:14px;max-width:100%}
+.seg button{border:0;background:transparent;color:var(--muted);font-weight:700;font-size:13px;padding:8px 14px;border-radius:10px;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;gap:7px;transition:background .2s,color .2s,box-shadow .2s;white-space:nowrap}
+.seg button[aria-checked=true]{background:var(--seg-active);color:var(--text);box-shadow:0 1px 4px rgba(0,0,0,.14)}
+.seg button[disabled]{opacity:.5;cursor:not-allowed}
+.seg.full{display:flex}.seg.full button{flex:1}
+
+/* buttons / inputs */
+.btn{font-weight:700;font-size:14px;padding:11px 18px;border-radius:14px;border:1px solid var(--border);background:var(--surface);color:var(--text);cursor:pointer;display:inline-flex;gap:8px;align-items:center;justify-content:center;transition:transform .15s,background .2s,box-shadow .2s,opacity .2s}
+.btn:active{transform:scale(.97)}
+.btn.primary{background:var(--accent);color:var(--on-accent);border-color:transparent;box-shadow:0 10px 20px -10px color-mix(in srgb,var(--accent) 80%,transparent)}
+.btn.warn{color:var(--danger);border-color:color-mix(in srgb,var(--danger) 35%,var(--border))}
+.btn[disabled]{opacity:.5;cursor:not-allowed;transform:none}
+.btn-row{display:flex;gap:10px;flex-wrap:wrap}
+.input{width:100%;padding:11px 14px;border-radius:13px;border:1px solid var(--border);background:var(--surface-2);color:var(--text);font:500 14px var(--font)}
+.input[disabled]{opacity:.55}
+label.lbl{display:block;font-weight:700;font-size:13.5px;margin-bottom:6px}
+.field{margin-bottom:18px}
+.field-head{display:flex;justify-content:space-between;align-items:baseline;gap:10px;font-weight:700;font-size:14px}
+.field-head output{color:var(--accent-ink);font-weight:800;font-variant-numeric:tabular-nums}
+.hint{font-size:12.5px;color:var(--muted);margin:4px 0 0}
+
+input[type=range]{-webkit-appearance:none;appearance:none;width:100%;height:30px;background:transparent;--p:50%;margin:2px 0 0}
+input[type=range]::-webkit-slider-runnable-track{height:8px;border-radius:99px;background:linear-gradient(to right,var(--accent) var(--p),var(--track) var(--p))}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:26px;height:26px;margin-top:-9px;border-radius:50%;background:#fff;border:4px solid var(--accent);box-shadow:0 3px 8px rgba(0,0,0,.25)}
+input[type=range]::-moz-range-track{height:8px;border-radius:99px;background:var(--track)}
+input[type=range]::-moz-range-progress{height:8px;border-radius:99px;background:var(--accent)}
+input[type=range]::-moz-range-thumb{width:18px;height:18px;border-radius:50%;background:#fff;border:4px solid var(--accent)}
+
+/* =====================================================================
+   MOISTURE CARD
+   ===================================================================== */
+[data-zone=dry]{--zone:var(--dry)}
+[data-zone=optimal]{--zone:var(--accent)}
+[data-zone=wet]{--zone:var(--wet)}
+.gauge{position:relative;width:min(100%,330px);margin:0 auto}
+.gauge-svg{display:block;width:100%;height:auto;overflow:visible}
+.g-track{stroke:var(--track)}
+.g-band{stroke:color-mix(in srgb,var(--accent) 45%,transparent)}
+.g-fill{stroke:var(--zone);transition:stroke .5s}
+.g-knob{fill:var(--surface);stroke:var(--zone);stroke-width:4;transition:stroke .5s;filter:drop-shadow(0 2px 4px rgba(0,0,0,.25))}
+.g-num{font-size:56px;font-weight:800;letter-spacing:-.04em;fill:var(--text);font-variant-numeric:tabular-nums}
+.g-pct{font-size:24px;font-weight:700;fill:var(--muted)}
+.g-cap{font-size:11px;font-weight:800;letter-spacing:.14em;fill:var(--muted)}
+.g-end{font-size:11px;font-weight:700;fill:var(--muted)}
+.trend{display:flex;justify-content:center;margin:-6px 0 12px}
+.trend span{display:inline-flex;align-items:center;gap:6px;padding:5px 12px;border-radius:99px;background:var(--surface-2);border:1px solid var(--border);font-size:12.5px;font-weight:700;color:var(--muted);font-variant-numeric:tabular-nums}
+.trend span.up{color:var(--wet)}.trend span.down{color:var(--dry)}
+.chips{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.chip{display:flex;align-items:center;justify-content:center;gap:7px;padding:9px 6px;border-radius:14px;font-size:12.5px;font-weight:800;border:1px solid var(--border);color:var(--muted);background:var(--surface-2);transition:all .35s}
+.chip i{width:8px;height:8px;border-radius:50%;background:currentColor;opacity:.45;transition:all .35s}
+.chip.dry{--c:var(--dry)}.chip.opt{--c:var(--accent)}.chip.wet{--c:var(--wet)}
+.chip[data-on=true]{color:color-mix(in srgb,var(--c) 70%,var(--text));background:color-mix(in srgb,var(--c) 14%,transparent);border-color:color-mix(in srgb,var(--c) 45%,transparent)}
+.chip[data-on=true] i{opacity:1;background:var(--c);box-shadow:0 0 0 4px color-mix(in srgb,var(--c) 24%,transparent)}
+.cond{display:flex;gap:12px;align-items:flex-start;margin-top:14px;padding:12px 14px;border-radius:16px;background:color-mix(in srgb,var(--zone) 10%,transparent);border:1px solid color-mix(in srgb,var(--zone) 32%,transparent);transition:all .4s}
+.cond .ico{color:var(--zone);margin-top:1px;width:22px;height:22px}
+.cond strong{display:block;font-size:14.5px}
+.cond span{font-size:13px;color:var(--muted)}
+.zb-wrap{position:relative;margin:26px 6px 34px}
+.zb{display:flex;height:12px;border-radius:99px;overflow:hidden}
+.zb i{display:block;height:100%;transition:flex-basis .5s}
+.zb .z-dry{background:var(--dry);opacity:.85}.zb .z-opt{background:var(--accent)}.zb .z-wet{background:var(--wet)}
+.zb-marker{position:absolute;top:-7px;left:0;width:5px;height:26px;border-radius:3px;background:var(--text);transform:translateX(-50%);transition:left .7s cubic-bezier(.3,.9,.3,1);box-shadow:0 0 0 3px var(--surface)}
+.zb-tick{position:absolute;top:20px;transform:translateX(-50%);font-size:11.5px;color:var(--muted);font-weight:700;white-space:nowrap;transition:left .5s}
+.zb-tick::before{content:"";position:absolute;left:50%;top:-8px;width:1px;height:6px;background:var(--muted);opacity:.6}
+.zb-edge{position:absolute;top:20px;font-size:11.5px;color:var(--muted);font-weight:700}
+
+/* =====================================================================
+   PUMP CARD
+   ===================================================================== */
+.pump-stage{position:relative;display:grid;place-items:center;padding:12px 0 6px}
+.ripple{position:absolute;left:50%;top:50%;width:120px;height:120px;margin:-60px 0 0 -60px;border-radius:50%;border:2px solid var(--accent);opacity:0;pointer-events:none}
+.pump-stage.on .ripple{animation:ripple 2.8s ease-out infinite}
+.pump-stage.on .ripple:nth-of-type(2){animation-delay:1.4s}
+@keyframes ripple{0%{transform:scale(.8);opacity:.45}100%{transform:scale(2.6);opacity:0}}
+.pump-switch{all:unset;box-sizing:border-box;position:relative;z-index:1;cursor:pointer;display:block;border-radius:999px;-webkit-tap-highlight-color:transparent}
+.pump-switch:focus-visible{outline:3px solid color-mix(in srgb,var(--accent) 55%,transparent);outline-offset:5px}
+.ps-track{position:relative;display:block;width:176px;height:84px;border-radius:999px;background:var(--track);border:1px solid var(--border);overflow:hidden;transition:background .4s,box-shadow .4s}
+.pump-switch[aria-checked=true] .ps-track{background:linear-gradient(135deg,var(--accent),color-mix(in srgb,var(--accent) 65%,var(--wet)));border-color:transparent;box-shadow:0 0 0 7px var(--accent-soft),0 14px 30px -10px color-mix(in srgb,var(--accent) 70%,transparent)}
+.ps-label{position:absolute;top:50%;transform:translateY(-50%);font-weight:900;letter-spacing:.1em;font-size:15px;transition:opacity .3s}
+.ps-label.off{right:27px;color:var(--muted)}
+.ps-label.on{left:27px;color:var(--on-accent);opacity:0}
+.pump-switch[aria-checked=true] .ps-label.off{opacity:0}
+.pump-switch[aria-checked=true] .ps-label.on{opacity:1}
+.ps-thumb{position:absolute;top:7px;left:7px;width:68px;height:68px;border-radius:50%;background:#fff;color:#7b8f83;display:grid;place-items:center;box-shadow:0 5px 14px rgba(0,0,0,.22);transition:transform .45s cubic-bezier(.3,1.35,.5,1),color .3s}
+.ps-thumb .ico{width:36px;height:36px;stroke-width:1.6}
+.pump-switch[aria-checked=true] .ps-thumb{transform:translateX(92px);color:var(--accent)}
+.pump-switch[aria-checked=true] .ps-thumb .ico{animation:spin 1s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.pump-switch[aria-busy=true]{opacity:.7;pointer-events:none}
+.pump-switch[aria-disabled=true]{opacity:.45;cursor:not-allowed}
+.pump-state{text-align:center;margin:10px 0 16px}
+.pump-state strong{display:block;font-size:19px;letter-spacing:-.02em}
+.pump-state span{font-size:13px;color:var(--muted);font-variant-numeric:tabular-nums}
+.mode-hint{font-size:12.5px;color:var(--muted);margin:10px 2px 0;text-align:center}
+
+/* =====================================================================
+   PROCESS CARD
+   ===================================================================== */
+.phase{margin-left:auto;font-size:12px;font-weight:800;padding:5px 12px;border-radius:99px;background:var(--surface-2);border:1px solid var(--border);color:var(--muted);letter-spacing:.02em;transition:all .3s}
+.phase[data-phase=watering]{color:var(--wet);background:color-mix(in srgb,var(--wet) 13%,transparent);border-color:color-mix(in srgb,var(--wet) 40%,transparent)}
+.phase[data-phase=cooldown]{color:var(--dry);background:color-mix(in srgb,var(--dry) 13%,transparent);border-color:color-mix(in srgb,var(--dry) 40%,transparent)}
+.phase[data-phase=cutoff]{color:var(--danger);background:color-mix(in srgb,var(--danger) 11%,transparent);border-color:color-mix(in srgb,var(--danger) 40%,transparent)}
+.steps{list-style:none;margin:0 0 18px;padding:0;display:flex}
+.steps li{flex:1;display:flex;flex-direction:column;align-items:center;gap:7px;position:relative;text-align:center;font-size:11.5px;font-weight:700;color:var(--muted)}
+.steps li:not(:last-child)::after{content:"";position:absolute;top:19px;left:calc(50% + 24px);width:calc(100% - 48px);height:3px;border-radius:3px;background:var(--track);transition:background .5s}
+.steps li.done:not(:last-child)::after{background:var(--accent)}
+.s-dot{width:38px;height:38px;border-radius:50%;display:grid;place-items:center;background:var(--surface-2);border:2px solid var(--border);transition:all .4s}
+.steps li.done{color:var(--text)}
+.steps li.done .s-dot{background:var(--accent);border-color:var(--accent);color:var(--on-accent)}
+.steps li.active{color:var(--text)}
+.steps li.active .s-dot{border-color:var(--wet);color:var(--wet);background:color-mix(in srgb,var(--wet) 12%,var(--surface));animation:glow 1.6s ease-in-out infinite}
+.steps li.warn .s-dot{background:var(--danger);border-color:var(--danger);color:#fff}
+@keyframes glow{0%,100%{box-shadow:0 0 0 0 color-mix(in srgb,var(--wet) 40%,transparent)}50%{box-shadow:0 0 0 8px transparent}}
+.prog-top{display:flex;justify-content:space-between;align-items:baseline;font-size:13px;font-weight:700;margin-bottom:8px;color:var(--muted)}
+.prog-top strong{color:var(--text);font-size:15px;font-variant-numeric:tabular-nums}
+.bar{height:14px;border-radius:99px;background:var(--track);overflow:hidden;position:relative}
+.bar span{position:absolute;inset:0 auto 0 0;width:0;border-radius:99px;background:linear-gradient(90deg,var(--wet),var(--accent));transition:width .7s cubic-bezier(.3,.9,.3,1)}
+.bar.live span::after{content:"";position:absolute;inset:0;background:repeating-linear-gradient(115deg,rgba(255,255,255,.28) 0 10px,transparent 10px 22px);animation:flow 1s linear infinite}
+@keyframes flow{to{background-position:44px 0}}
+.stat-cap{font-size:11.5px;font-weight:800;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin:16px 0 8px}
+.stat-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
+.stat{background:var(--surface-2);border:1px solid var(--border);border-radius:16px;padding:12px 14px;min-width:0}
+.stat .k{font-size:12px;color:var(--muted);font-weight:700}
+.stat .v{font-size:22px;font-weight:800;letter-spacing:-.025em;font-variant-numeric:tabular-nums;margin:1px 0}
+.stat .s{font-size:11.5px;color:var(--muted)}
+.note{margin:14px 2px 0;font-size:13px;color:var(--muted)}
+
+/* =====================================================================
+   CHART / DEVICE
+   ===================================================================== */
+.chart-wrap{position:relative;height:250px;margin:0 -4px}
+.chart-wrap canvas{display:block;width:100%;height:100%;touch-action:pan-y}
+.tip{position:absolute;pointer-events:none;z-index:3;padding:8px 11px;border-radius:12px;background:var(--text);color:var(--bg);font-size:12px;font-weight:600;line-height:1.35;box-shadow:0 8px 20px rgba(0,0,0,.25);white-space:nowrap;transform:translate(-50%,-100%)}
+.tip b{font-size:15px;font-variant-numeric:tabular-nums}
+.legend{display:flex;gap:14px;flex-wrap:wrap;margin-top:10px;font-size:12px;color:var(--muted);font-weight:600}
+.legend span{display:inline-flex;align-items:center;gap:6px}
+.legend i{width:14px;height:8px;border-radius:3px;display:inline-block}
+.mini-stats{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:12px}
+.mini-stats .stat{padding:9px 12px}.mini-stats .v{font-size:18px}
+.kv{display:grid;gap:0;margin:0}
+.kv div{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid var(--border);font-size:13.5px}
+.kv div:last-child{border-bottom:0}
+.kv dt{color:var(--muted);font-weight:600}
+.kv dd{margin:0;font-weight:700;font-variant-numeric:tabular-nums;text-align:right}
+.sig{display:inline-flex;align-items:flex-end;gap:2px;height:14px;margin-right:6px;vertical-align:middle}
+.sig i{width:4px;border-radius:2px;background:var(--track)}
+.sig i:nth-child(1){height:5px}.sig i:nth-child(2){height:8px}.sig i:nth-child(3){height:11px}.sig i:nth-child(4){height:14px}
+.sig i[data-on=true]{background:var(--accent)}
+
+/* =====================================================================
+   HISTORY VIEW
+   ===================================================================== */
+.sum-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
+@media(min-width:560px){.sum-grid{grid-template-columns:repeat(3,1fr)}}
+@media(min-width:900px){.sum-grid{grid-template-columns:repeat(6,1fr)}}
+.hbars{display:flex;align-items:flex-end;gap:3px;height:130px;padding-top:6px}
+.hb{flex:1;height:100%;display:flex;align-items:flex-end;border-radius:6px 6px 3px 3px;background:var(--surface-2);position:relative}
+.hb span{display:block;width:100%;border-radius:6px 6px 3px 3px;background:var(--c,var(--accent));min-height:2px;transition:height .6s cubic-bezier(.3,.9,.3,1)}
+.hb[data-z=dry]{--c:var(--dry)}.hb[data-z=wet]{--c:var(--wet)}
+.hlabels{display:flex;justify-content:space-between;font-size:11px;color:var(--muted);font-weight:700;margin-top:6px}
+.log{list-style:none;margin:0;padding:0}
+.log li{display:flex;align-items:center;gap:12px;padding:12px 0;border-bottom:1px solid var(--border)}
+.log li:last-child{border-bottom:0}
+.log-ico{width:40px;height:40px;border-radius:13px;display:grid;place-items:center;background:color-mix(in srgb,var(--wet) 14%,transparent);color:var(--wet);flex:none}
+.log-ico.manual{background:var(--accent-soft);color:var(--accent-ink)}
+.log-main{flex:1;min-width:0;display:flex;flex-direction:column}
+.log-main strong{font-size:14.5px}
+.log-main span{font-size:12.5px;color:var(--muted);font-variant-numeric:tabular-nums}
+.log-end{text-align:right;display:flex;flex-direction:column;align-items:flex-end;gap:3px;font-variant-numeric:tabular-nums;font-size:13.5px}
+.tag{font-style:normal;font-size:10.5px;font-weight:800;padding:2px 8px;border-radius:99px;background:color-mix(in srgb,var(--danger) 13%,transparent);color:var(--danger)}
+.empty{padding:26px 10px;text-align:center;color:var(--muted);font-size:14px}
+
+/* =====================================================================
+   SETTINGS
+   ===================================================================== */
+.swatches{display:flex;gap:12px;flex-wrap:wrap}
+.swatch{width:42px;height:42px;border-radius:50%;border:3px solid var(--surface);background:var(--sw);cursor:pointer;box-shadow:0 0 0 2px var(--border);transition:transform .2s,box-shadow .2s;display:grid;place-items:center;color:#fff;padding:0}
+.swatch .ico{opacity:0;width:18px;height:18px;stroke-width:3}
+.swatch[aria-checked=true]{box-shadow:0 0 0 3px var(--sw);transform:scale(1.06)}
+.swatch[aria-checked=true] .ico{opacity:1}
+details.api{margin-top:14px;border:1px solid var(--border);border-radius:16px;background:var(--surface-2);padding:2px 14px}
+details.api summary{cursor:pointer;font-weight:700;font-size:13.5px;padding:12px 0}
+details.api pre{margin:0 0 14px;overflow:auto;font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--text);white-space:pre}
+.dirty{font-size:12px;font-weight:800;color:var(--dry);display:none}
+.dirty.on{display:inline}
+
+/* toasts */
+.toasts{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(var(--nav-h) + env(safe-area-inset-bottom) + 18px);z-index:60;display:grid;gap:8px;width:min(440px,100% - 28px);pointer-events:none}
+@media(min-width:760px){.toasts{bottom:26px}}
+.toast{display:flex;align-items:center;gap:10px;padding:12px 16px;border-radius:16px;background:var(--text);color:var(--bg);font-size:13.5px;font-weight:600;box-shadow:0 14px 34px -10px rgba(0,0,0,.4);animation:toastIn .35s both cubic-bezier(.2,.9,.3,1.2)}
+.toast.ok .ico{color:#4ade80}.toast.warn .ico,.toast.error .ico{color:#fbbf24}.toast.error .ico{color:#fb7185}
+.toast.out{animation:toastOut .3s both}
+@keyframes toastIn{from{opacity:0;transform:translateY(16px) scale(.96)}to{opacity:1;transform:none}}
+@keyframes toastOut{to{opacity:0;transform:translateY(10px)}}
+
+.foot{text-align:center;color:var(--muted);font-size:12px;margin:26px 0 0}
+
+@media(prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important;scroll-behavior:auto!important}}
+html[data-motion=off] *,html[data-motion=off] *::before,html[data-motion=off] *::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important}
+</style>
+</head>
+<body>
+
+<!-- ============================ ICON SPRITE ============================ -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+  <symbol id="i-leaf" viewBox="0 0 24 24"><path d="M5 19c0-8 5-13 14-14 0 9-5 14-13 14z"/><path d="M5 19c3-4 6-6 9-8"/></symbol>
+  <symbol id="i-drop" viewBox="0 0 24 24"><path d="M12 3.2c3.6 4.2 6 7.3 6 10.3a6 6 0 0 1-12 0c0-3 2.4-6.1 6-10.3z"/></symbol>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="M3 11l9-7 9 7v9a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"/></symbol>
+  <symbol id="i-history" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l3 2"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><path d="M4 6h8M18 6h2M4 12h2M12 12h8M4 18h9M19 18h1"/><circle cx="15" cy="6" r="2.5"/><circle cx="9" cy="12" r="2.5"/><circle cx="16" cy="18" r="2.5"/></symbol>
+  <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M5.3 5.3l1.4 1.4M17.3 17.3l1.4 1.4M5.3 18.7l1.4-1.4M17.3 6.7l1.4-1.4"/></symbol>
+  <symbol id="i-moon" viewBox="0 0 24 24"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
+  <symbol id="i-timer" viewBox="0 0 24 24"><circle cx="12" cy="13.5" r="7.5"/><path d="M12 9.5v4l2.5 1.5M9.5 2.5h5"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24"><path d="M12 3.5l9.5 16.5h-19z"/><path d="M12 10v4M12 17h.01"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></symbol>
+  <symbol id="i-hand" viewBox="0 0 24 24"><path d="M8 12V5.5a1.5 1.5 0 0 1 3 0V11M11 10V4a1.5 1.5 0 0 1 3 0v7M14 10V5.5a1.5 1.5 0 0 1 3 0V14a6 6 0 0 1-6 6h-.5a5 5 0 0 1-4-2L4 14.5a1.5 1.5 0 0 1 2.3-1.8L8 14"/></symbol>
+  <symbol id="i-auto" viewBox="0 0 24 24"><path d="M20 11a8 8 0 0 0-14-4.5L4 9M4 4v5h5M4 13a8 8 0 0 0 14 4.5L20 15M20 20v-5h-5"/></symbol>
+  <symbol id="i-pump" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 12V4.6M12 12l6.4 3.7M12 12l-6.4 3.7"/><circle cx="12" cy="12" r="1.7" fill="currentColor"/></symbol>
+  <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4v11M7.5 10.5L12 15l4.5-4.5M5 20h14"/></symbol>
+  <symbol id="i-chip" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/><path d="M9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4"/></symbol>
+  <symbol id="i-trend" viewBox="0 0 24 24"><path d="M3 17l6-6 4 4 8-8M15 7h6v6"/></symbol>
+  <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M12 3v18M3 8h18M3 16h18"/></symbol>
+  <symbol id="i-plug" viewBox="0 0 24 24"><path d="M9 2v5M15 2v5M6 7h12v4a6 6 0 0 1-12 0zM12 17v5"/></symbol>
+  <symbol id="i-palette" viewBox="0 0 24 24"><path d="M12 3a9 9 0 1 0 0 18c1.2 0 1.8-.8 1.8-1.7 0-1.3-1.2-1.6-1.2-2.8 0-1 .8-1.7 1.9-1.7H17a4 4 0 0 0 4-4C21 6.5 17 3 12 3z"/><circle cx="7.5" cy="11" r="1"/><circle cx="10" cy="7" r="1"/><circle cx="15" cy="7.5" r="1"/></symbol>
+  <symbol id="i-wrench" viewBox="0 0 24 24"><path d="M14.7 6.3a4 4 0 0 0-5 5L3.5 17.5a2 2 0 0 0 3 3l6.2-6.2a4 4 0 0 0 5-5l-2.6 2.6-2.2-.5-.5-2.2z"/></symbol>
+</svg>
+
+<!-- ================================ HEADER ================================ -->
+<header class="app-header">
+  <div class="container header-inner">
+    <div class="brand">
+      <span class="logo"><svg class="ico"><use href="#i-leaf"/></svg></span>
+      <div>GreenDrip<small>ESP32 irrigation controller</small></div>
+    </div>
+    <span class="badge-demo" id="demoBadge" hidden>DEMO</span>
+    <span class="spacer"></span>
+    <div class="conn" id="conn" data-state="connecting" role="status" aria-live="polite">
+      <span class="dot"></span><span id="connText">Connecting…</span><span class="lat" id="connLat"></span>
+    </div>
+    <button class="icon-btn" id="themeBtn" aria-label="Toggle light / dark mode">
+      <svg class="ico ico-sun"><use href="#i-sun"/></svg><svg class="ico ico-moon"><use href="#i-moon"/></svg>
+    </button>
+  </div>
+</header>
+
+<nav class="nav" id="nav" aria-label="Sections">
+  <button data-view="overview" aria-current="page"><svg class="ico"><use href="#i-home"/></svg>Overview</button>
+  <button data-view="history"><svg class="ico"><use href="#i-history"/></svg>History</button>
+  <button data-view="settings"><svg class="ico"><use href="#i-settings"/></svg>Settings</button>
+</nav>
+
+<main class="container">
+  <div class="banner" id="offlineBanner" hidden role="alert">
+    <svg class="ico"><use href="#i-alert"/></svg>
+    <div><strong>Device unreachable.</strong> <span id="offlineMsg">Showing last known data. Controls are disabled until the connection is restored.</span></div>
+  </div>
+
+  <!-- ============================== OVERVIEW ============================== -->
+  <section id="view-overview" class="view overview">
+
+    <article class="card c-moist" id="moistureCard" data-zone="optimal" style="--i:0">
+      <div class="card-head">
+        <h2 class="card-title"><svg class="ico"><use href="#i-drop"/></svg>Soil moisture</h2>
+        <span class="card-sub" id="updated">Waiting for data…</span>
+      </div>
+
+      <div class="gauge">
+        <svg class="gauge-svg" viewBox="0 0 260 205" role="img" aria-label="Soil moisture gauge" id="gaugeSvg">
+          <g transform="rotate(150 130 125)">
+            <circle class="g-track" cx="130" cy="125" r="90" fill="none" stroke-width="16" stroke-linecap="round" stroke-dasharray="376.99 565.49"/>
+            <circle class="g-band" id="gBand" cx="130" cy="125" r="106" fill="none" stroke-width="6" stroke-dasharray="0 666"/>
+            <circle class="g-fill" id="gFill" cx="130" cy="125" r="90" fill="none" stroke-width="16" stroke-linecap="round" stroke-dasharray="0 565.49"/>
+          </g>
+          <circle class="g-knob" id="gKnob" r="9" cx="52" cy="170" />
+          <text class="g-num" x="130" y="130" text-anchor="middle"><tspan id="gVal">--</tspan><tspan class="g-pct" dx="2">%</tspan></text>
+          <text class="g-cap" x="130" y="154" text-anchor="middle">SOIL MOISTURE</text>
+          <text class="g-end" x="46" y="196" text-anchor="middle">0</text>
+          <text class="g-end" x="214" y="196" text-anchor="middle">100</text>
+        </svg>
+      </div>
+      <div class="trend"><span id="trend">Collecting trend…</span></div>
+
+      <div class="chips" id="chips">
+        <div class="chip dry" data-z="dry" data-on="false"><i></i>Dry</div>
+        <div class="chip opt" data-z="optimal" data-on="false"><i></i>Optimal</div>
+        <div class="chip wet" data-z="wet" data-on="false"><i></i>Wet</div>
+      </div>
+
+      <div class="cond" id="cond" aria-live="polite">
+        <svg class="ico" id="condIco"><use href="#i-check"/></svg>
+        <div><strong id="condTitle">Reading sensor…</strong><span id="condText">Waiting for the first measurement.</span></div>
+      </div>
+
+      <div class="zb-wrap" aria-hidden="true">
+        <div class="zb"><i class="z-dry" id="zbDry"></i><i class="z-opt" id="zbOpt"></i><i class="z-wet" id="zbWet"></i></div>
+        <div class="zb-marker" id="zbMarker"></div>
+        <span class="zb-edge" style="left:0">0</span>
+        <span class="zb-tick" id="tickLow">35</span>
+        <span class="zb-tick" id="tickHigh">70</span>
+        <span class="zb-edge" style="right:0">100</span>
+      </div>
+    </article>
+
+    <div class="col c-right">
+      <article class="card" style="--i:1">
+        <div class="card-head">
+          <h2 class="card-title"><svg class="ico"><use href="#i-pump"/></svg>Water pump</h2>
+        </div>
+        <div class="pump-stage" id="pumpStage">
+          <i class="ripple"></i><i class="ripple"></i>
+          <button class="pump-switch" id="pumpSwitch" role="switch" aria-checked="false" aria-label="Water pump power">
+            <span class="ps-track">
+              <span class="ps-label on">ON</span><span class="ps-label off">OFF</span>
+              <span class="ps-thumb"><svg class="ico"><use href="#i-pump"/></svg></span>
+            </span>
+          </button>
+        </div>
+        <div class="pump-state" aria-live="polite"><strong id="pumpState">Pump is off</strong><span id="pumpSub">Connecting to device…</span></div>
+        <div class="seg full" id="modeSeg" role="radiogroup" aria-label="Operating mode">
+          <button role="radio" data-mode="manual" aria-checked="false"><svg class="ico sm"><use href="#i-hand"/></svg>Manual</button>
+          <button role="radio" data-mode="auto" aria-checked="false"><svg class="ico sm"><use href="#i-auto"/></svg>Automatic</button>
+        </div>
+        <p class="mode-hint" id="modeHint"></p>
+      </article>
+
+      <article class="card" style="--i:2">
+        <div class="card-head">
+          <h2 class="card-title"><svg class="ico"><use href="#i-timer"/></svg>Irrigation process</h2>
+          <span class="phase" id="phase" data-phase="idle">Idle</span>
+        </div>
+        <ol class="steps" id="steps">
+          <li><span class="s-dot"><svg class="ico"><use href="#i-drop"/></svg></span><span class="s-label">Soil check</span></li>
+          <li><span class="s-dot"><svg class="ico"><use href="#i-pump"/></svg></span><span class="s-label">Pump on</span></li>
+          <li><span class="s-dot"><svg class="ico"><use href="#i-trend"/></svg></span><span class="s-label">Watering</span></li>
+          <li><span class="s-dot"><svg class="ico"><use href="#i-check"/></svg></span><span class="s-label">Complete</span></li>
+        </ol>
+        <div class="prog-top"><span id="progLabel">Progress to target</span><strong id="progPct">0%</strong></div>
+        <div class="bar" id="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span id="barFill"></span></div>
+        <div class="stat-cap" id="statCap">Current session</div>
+        <div class="stat-grid">
+          <div class="stat"><div class="k">Duration</div><div class="v" id="stDur">—</div><div class="s" id="stDurS">&nbsp;</div></div>
+          <div class="stat"><div class="k">Water used</div><div class="v" id="stWater">—</div><div class="s" id="stWaterS">&nbsp;</div></div>
+          <div class="stat"><div class="k">Moisture gain</div><div class="v" id="stGain">—</div><div class="s" id="stGainS">&nbsp;</div></div>
+          <div class="stat"><div class="k" id="stEtaK">Time to target</div><div class="v" id="stEta">—</div><div class="s" id="stEtaS">&nbsp;</div></div>
+        </div>
+        <p class="note" id="procNote"></p>
+      </article>
+    </div>
+
+    <article class="card c-trend" style="--i:3">
+      <div class="card-head">
+        <h2 class="card-title"><svg class="ico"><use href="#i-trend"/></svg>Moisture trend</h2>
+        <div class="seg" id="rangeSeg" role="radiogroup" aria-label="Chart range" style="margin-left:auto">
+          <button role="radio" data-range="600000" aria-checked="true">10 min</button>
+          <button role="radio" data-range="3600000" aria-checked="false">1 h</button>
+          <button role="radio" data-range="21600000" aria-checked="false">6 h</button>
+          <button role="radio" data-range="86400000" aria-checked="false">24 h</button>
+        </div>
+      </div>
+      <div class="chart-wrap"><canvas id="chart" aria-label="Soil moisture trend chart" role="img"></canvas><div class="tip" id="tip" hidden></div></div>
+      <div class="legend">
+        <span><i style="background:var(--accent)"></i>Moisture</span>
+        <span><i style="background:color-mix(in srgb,var(--accent) 22%,transparent)"></i>Target range</span>
+        <span><i style="background:color-mix(in srgb,var(--wet) 35%,transparent)"></i>Pump running</span>
+      </div>
+      <div class="mini-stats">
+        <div class="stat"><div class="k">Min</div><div class="v" id="rMin">—</div></div>
+        <div class="stat"><div class="k">Average</div><div class="v" id="rAvg">—</div></div>
+        <div class="stat"><div class="k">Max</div><div class="v" id="rMax">—</div></div>
+      </div>
+    </article>
+
+    <article class="card c-device" style="--i:4">
+      <div class="card-head"><h2 class="card-title"><svg class="ico"><use href="#i-chip"/></svg>ESP32 device</h2></div>
+      <dl class="kv">
+        <div><dt>Status</dt><dd id="dStatus">—</dd></div>
+        <div><dt>Signal</dt><dd><span class="sig" id="dSig"><i></i><i></i><i></i><i></i></span><span id="dRssi">—</span></dd></div>
+        <div><dt>Latency</dt><dd id="dLat">—</dd></div>
+        <div><dt>IP address</dt><dd id="dIp">—</dd></div>
+        <div><dt>Uptime</dt><dd id="dUp">—</dd></div>
+        <div><dt>Sensor raw</dt><dd id="dRaw">—</dd></div>
+        <div><dt>Firmware</dt><dd id="dFw">—</dd></div>
+      </dl>
+    </article>
+  </section>
+
+  <!-- =============================== HISTORY =============================== -->
+  <section id="view-history" class="view" hidden>
+    <article class="card" style="--i:0">
+      <div class="card-head">
+        <h2 class="card-title"><svg class="ico"><use href="#i-history"/></svg>Last 24 hours</h2>
+        <button class="btn" id="exportBtn" style="margin-left:auto;padding:8px 14px"><svg class="ico sm"><use href="#i-download"/></svg>Export CSV</button>
+      </div>
+      <div class="sum-grid">
+        <div class="stat"><div class="k">Sessions</div><div class="v" id="hSessions">—</div></div>
+        <div class="stat"><div class="k">Water used</div><div class="v" id="hWater">—</div></div>
+        <div class="stat"><div class="k">Pump runtime</div><div class="v" id="hRun">—</div></div>
+        <div class="stat"><div class="k">Avg moisture</div><div class="v" id="hAvg">—</div></div>
+        <div class="stat"><div class="k">Lowest</div><div class="v" id="hMin">—</div></div>
+        <div class="stat"><div class="k">Highest</div><div class="v" id="hMax">—</div></div>
+      </div>
+    </article>
+
+    <article class="card" style="--i:1">
+      <div class="card-head"><h2 class="card-title"><svg class="ico"><use href="#i-trend"/></svg>Hourly average moisture</h2><span class="card-sub">Colour = soil condition</span></div>
+      <div class="hbars" id="hbars"></div>
+      <div class="hlabels" id="hlabels"></div>
+    </article>
+
+    <article class="card" style="--i:2">
+      <div class="card-head"><h2 class="card-title"><svg class="ico"><use href="#i-drop"/></svg>Irrigation log</h2><span class="card-sub" id="logCount"></span></div>
+      <ul class="log" id="log"></ul>
+    </article>
+  </section>
+
+  <!-- ============================== SETTINGS =============================== -->
+  <section id="view-settings" class="view two" hidden>
+    <article class="card" style="--i:0">
+      <div class="card-head"><h2 class="card-title"><svg class="ico"><use href="#i-sliders"/></svg>Irrigation thresholds</h2><span class="dirty" id="dirty" style="margin-left:auto">● Unsaved changes</span></div>
+      <div class="field">
+        <div class="field-head"><label for="sLow">Start watering below</label><output id="oLow">35%</output></div>
+        <input type="range" id="sLow" min="10" max="60" step="1">
+        <p class="hint">In Automatic mode the pump turns on when moisture falls to this level.</p>
+      </div>
+      <div class="field">
+        <div class="field-head"><label for="sHigh">Stop watering at</label><output id="oHigh">70%</output></div>
+        <input type="range" id="sHigh" min="40" max="95" step="1">
+        <p class="hint">Target moisture. Always at least 10 points above the start level.</p>
+      </div>
+      <div class="zb-wrap" style="margin-top:6px;margin-bottom:22px" aria-hidden="true">
+        <div class="zb"><i class="z-dry" id="pvDry"></i><i class="z-opt" id="pvOpt"></i><i class="z-wet" id="pvWet"></i></div>
+      </div>
+      <div class="field">
+        <div class="field-head"><label for="sMax">Safety cut-off (max run time)</label><output id="oMax">10 min</output></div>
+        <input type="range" id="sMax" min="1" max="30" step="1">
+        <p class="hint">The pump is always stopped after this long, in any mode.</p>
+      </div>
+      <div class="field">
+        <div class="field-head"><label for="sCool">Cool-down between cycles</label><output id="oCool">2 min</output></div>
+        <input type="range" id="sCool" min="0" max="30" step="1">
+        <p class="hint">Minimum rest before Automatic mode may start another cycle.</p>
+      </div>
+      <div class="btn-row">
+        <button class="btn primary" id="saveSettings" disabled><svg class="ico sm"><use href="#i-check"/></svg>Save to device</button>
+        <button class="btn" id="resetSettings" disabled>Discard</button>
+      </div>
+    </article>
+
+    <div class="col">
+      <article class="card" style="--i:1">
+        <div class="card-head"><h2 class="card-title"><svg class="ico"><use href="#i-palette"/></svg>Appearance</h2></div>
+        <div class="field">
+          <label class="lbl">Theme</label>
+          <div class="seg full" id="themeSeg" role="radiogroup" aria-label="Theme">
+            <button role="radio" data-theme-pref="system" aria-checked="false">System</button>
+            <button role="radio" data-theme-pref="light" aria-checked="false"><svg class="ico sm"><use href="#i-sun"/></svg>Light</button>
+            <button role="radio" data-theme-pref="dark" aria-checked="false"><svg class="ico sm"><use href="#i-moon"/></svg>Dark</button>
+          </div>
+        </div>
+        <div class="field">
+          <label class="lbl">Accent colour</label>
+          <div class="swatches" id="swatches" role="radiogroup" aria-label="Accent colour">
+            <button class="swatch" role="radio" data-accent="green" aria-label="Green" style="--sw:#16a34a"><svg class="ico"><use href="#i-check"/></svg></button>
+            <button class="swatch" role="radio" data-accent="emerald" aria-label="Emerald" style="--sw:#059669"><svg class="ico"><use href="#i-check"/></svg></button>
+            <button class="swatch" role="radio" data-accent="teal" aria-label="Teal" style="--sw:#0d9488"><svg class="ico"><use href="#i-check"/></svg></button>
+            <button class="swatch" role="radio" data-accent="lime" aria-label="Lime" style="--sw:#65a30d"><svg class="ico"><use href="#i-check"/></svg></button>
+          </div>
+        </div>
+        <div class="field" style="margin-bottom:0">
+          <label class="lbl">Animations</label>
+          <div class="seg" id="motionSeg" role="radiogroup" aria-label="Animations">
+            <button role="radio" data-motion="on" aria-checked="true">On</button>
+            <button role="radio" data-motion="off" aria-checked="false">Off</button>
+          </div>
+        </div>
+      </article>
+
+      <article class="card" style="--i:2">
+        <div class="card-head"><h2 class="card-title"><svg class="ico"><use href="#i-plug"/></svg>Connection &amp; API</h2></div>
+        <div class="field">
+          <label class="lbl">Data source</label>
+          <div class="seg full" id="srcSeg" role="radiogroup" aria-label="Data source">
+            <button role="radio" data-src="demo" aria-checked="true">Demo mode</button>
+            <button role="radio" data-src="live" aria-checked="false">Live ESP32</button>
+          </div>
+        </div>
+        <div class="field">
+          <label class="lbl" for="baseUrl">Device address</label>
+          <input class="input" id="baseUrl" type="url" inputmode="url" placeholder="Leave empty to use this ESP32" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="field">
+          <label class="lbl" for="pollSel">Refresh interval</label>
+          <select class="input" id="pollSel"><option value="1000">Every 1 second</option><option value="2000">Every 2 seconds</option><option value="5000">Every 5 seconds</option></select>
+        </div>
+        <div class="btn-row">
+          <button class="btn primary" id="applyConn">Apply</button>
+          <button class="btn" id="testConn">Test connection</button>
+        </div>
+        <details class="api">
+          <summary>API reference for the ESP32 firmware</summary>
+<pre>GET  /api/status
+ → { ts, moisture, raw, pump, mode, cooldownRemainingSec,
+     session:{active,startedAt,startMoisture,elapsedSec,waterL,trigger},
+     lastStop:{reason,ts},
+     device:{ip,rssi,firmware,uptimeSec} }
+POST /api/pump      { "on": true|false }
+POST /api/mode      { "mode": "manual"|"auto" }
+GET  /api/settings  → { low, high, maxRunMin, cooldownMin }
+POST /api/settings  { low, high, maxRunMin, cooldownMin }
+GET  /api/history?range=&lt;ms&gt;  → [ { t, v } ]   (t = epoch ms)
+GET  /api/sessions?limit=&lt;n&gt;  → [ { id, start, end, durationSec,
+        startMoisture, endMoisture, waterL, trigger, reason } ]
+
+reason: target_reached | manual | max_runtime | overwater
+This page is served by the ESP32 itself, so leave the
+device address empty. Use "Demo mode" to preview without hardware.</pre>
+        </details>
+      </article>
+
+      <article class="card" id="demoTools" style="--i:3">
+        <div class="card-head"><h2 class="card-title"><svg class="ico"><use href="#i-wrench"/></svg>Demo tools</h2></div>
+        <div class="field">
+          <label class="lbl">Simulation speed</label>
+          <div class="seg full" id="speedSeg" role="radiogroup" aria-label="Simulation speed">
+            <button role="radio" data-speed="1" aria-checked="true">1×</button>
+            <button role="radio" data-speed="3" aria-checked="false">3×</button>
+            <button role="radio" data-speed="10" aria-checked="false">10×</button>
+          </div>
+          <p class="hint">Demo soil dries much faster than real soil so you can watch automatic irrigation happen within minutes.</p>
+        </div>
+        <div class="btn-row">
+          <button class="btn" id="dryBtn"><svg class="ico sm"><use href="#i-drop"/></svg>Simulate dry soil</button>
+          <button class="btn warn" id="dropBtn">Simulate disconnect</button>
+          <button class="btn" id="resetDemo">Reset demo data</button>
+        </div>
+      </article>
+    </div>
+  </section>
+
+  <p class="foot">GreenDrip dashboard · single-file HTML · data layer is swappable between demo and live ESP32</p>
+</main>
+
+<div class="toasts" id="toasts" aria-live="polite"></div>
+
+<script>
+'use strict';
+/* =======================================================================
+   1. HELPERS
+   ======================================================================= */
+const $  = (s, r=document) => r.querySelector(s);
+const $$ = (s, r=document) => [...r.querySelectorAll(s)];
+const clamp = (v,a,b) => Math.min(b, Math.max(a, v));
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const store = {
+  get(k,d){ try{ const v=localStorage.getItem('greendrip.'+k); return v==null?d:JSON.parse(v); }catch(e){ return d; } },
+  set(k,v){ try{ localStorage.setItem('greendrip.'+k, JSON.stringify(v)); }catch(e){} },
+  del(k){ try{ localStorage.removeItem('greendrip.'+k); }catch(e){} }
+};
+const fmtDur = sec => {
+  sec = Math.max(0, Math.round(sec)); const m = Math.floor(sec/60), s = sec%60;
+  if (m >= 60) return `${Math.floor(m/60)}h ${String(m%60).padStart(2,'0')}m`;
+  return `${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+};
+const fmtTime = ts => new Date(ts).toLocaleTimeString([], {hour:'numeric', minute:'2-digit'});
+const fmtDay = ts => {
+  const d = new Date(ts), t = new Date(); const y = new Date(); y.setDate(t.getDate()-1);
+  const lbl = d.toDateString()===t.toDateString() ? 'Today' : d.toDateString()===y.toDateString() ? 'Yesterday' : d.toLocaleDateString([], {month:'short', day:'numeric'});
+  return `${lbl}, ${fmtTime(ts)}`;
+};
+const hexA = (h,a) => { h=h.replace('#',''); if(h.length===3) h=h.split('').map(x=>x+x).join(''); const n=parseInt(h,16); return `rgba(${(n>>16)&255},${(n>>8)&255},${n&255},${a})`; };
+const reduceMotionMQ = matchMedia('(prefers-reduced-motion: reduce)');
+
+/* =======================================================================
+   2. API LAYER  (the only part that talks to the ESP32 / demo device)
+   -----------------------------------------------------------------------
+   The UI only calls the `Api` object. Two interchangeable adapters:
+     • DemoAdapter – simulated ESP32 running in the browser
+     • HttpAdapter – real device over HTTP/JSON (see API reference in the
+       Settings page). To integrate the real hardware, set the device
+       address in Settings → Connection & API and choose "Live ESP32".
+   Normalised status object returned by getStatus():
+     { ts, moisture, raw, pump, mode, session|null, cooldownRemainingSec,
+       lastStop|null, device:{ip,rssi,firmware,uptimeSec}, latency }
+   ======================================================================= */
+const DEFAULT_SETTINGS = { low:35, high:70, maxRunMin:10, cooldownMin:2 };
+
+class ApiError extends Error {}
+
+function normalizeStatus(r, latency){
+  const n = (v,d=0) => Number.isFinite(+v) ? +v : d;
+  const s = r.session && r.session.active ? {
+    startedAt: n(r.session.startedAt, Date.now()), startMoisture: n(r.session.startMoisture),
+    elapsedSec: n(r.session.elapsedSec), waterL: n(r.session.waterL), trigger: r.session.trigger==='auto' ? 'auto' : 'manual'
+  } : null;
+  const d = r.device || {};
+  return {
+    ts: n(r.ts, Date.now()), moisture: clamp(n(r.moisture), 0, 100), raw: r.raw!=null ? n(r.raw) : null,
+    pump: !!r.pump, mode: r.mode==='auto' ? 'auto' : 'manual', session: s,
+    cooldownRemainingSec: n(r.cooldownRemainingSec),
+    lastStop: r.lastStop ? { reason:String(r.lastStop.reason||'manual'), ts:n(r.lastStop.ts) } : null,
+    device: { ip:d.ip||'—', rssi:n(d.rssi,-60), firmware:d.firmware||'—', uptimeSec:n(d.uptimeSec) },
+    latency: latency ?? 0
+  };
+}
+function normalizeSettings(r){
+  const n = (v,d) => Number.isFinite(+v) ? +v : d;
+  return { low:n(r.low,DEFAULT_SETTINGS.low), high:n(r.high,DEFAULT_SETTINGS.high), maxRunMin:n(r.maxRunMin,DEFAULT_SETTINGS.maxRunMin), cooldownMin:n(r.cooldownMin,DEFAULT_SETTINGS.cooldownMin) };
+}
+function normalizeHistory(a){
+  return (Array.isArray(a)?a:[]).map(p => { let t = Array.isArray(p)?p[0]:p.t, v = Array.isArray(p)?p[1]:p.v; t=+t; if(t<1e12) t*=1000; return {t, v:+v}; }).filter(p=>isFinite(p.t)&&isFinite(p.v)).sort((a,b)=>a.t-b.t);
+}
+function normalizeSessions(a){
+  return (Array.isArray(a)?a:[]).map(s => ({
+    id:s.id, start:+s.start, end:+s.end, durationSec:+(s.durationSec ?? (s.end-s.start)/1000), startMoisture:+s.startMoisture, endMoisture:+s.endMoisture,
+    waterL:+(s.waterL||0), trigger:s.trigger==='auto'?'auto':'manual', reason:s.reason||'target_reached'
+  })).sort((a,b)=>b.end-a.end);
+}
+
+/* ---------- Live adapter: real ESP32 over HTTP/JSON ---------- */
+class HttpAdapter {
+  constructor(cfg){ this.cfg = cfg; }
+  async _req(path, {method='GET', body}={}){
+    const ctrl = new AbortController(); const timer = setTimeout(()=>ctrl.abort(), 4000); const t0 = performance.now();
+    try{
+      const res = await fetch(this.cfg.baseUrl.replace(/\/+$/,'') + path, {
+        method, cache:'no-store', signal:ctrl.signal,
+        headers: body ? {'Content-Type':'application/json'} : undefined,
+        body: body ? JSON.stringify(body) : undefined
+      });
+      if(!res.ok) throw new ApiError('HTTP '+res.status);
+      return { data: await res.json(), latency: Math.round(performance.now()-t0) };
+    }catch(e){
+      throw e instanceof ApiError ? e : new ApiError(e.name==='AbortError' ? 'Request timed out' : 'Network error');
+    }finally{ clearTimeout(timer); }
+  }
+  async getStatus(){ const {data,latency} = await this._req('/api/status'); return normalizeStatus(data, latency); }
+  async setPump(on){ await this._req('/api/pump',{method:'POST',body:{on:!!on}}); return this.getStatus(); }
+  async setMode(mode){ await this._req('/api/mode',{method:'POST',body:{mode}}); return this.getStatus(); }
+  async getSettings(){ return normalizeSettings((await this._req('/api/settings')).data); }
+  async saveSettings(s){ await this._req('/api/settings',{method:'POST',body:s}); return this.getSettings(); }
+  async getHistory(rangeMs){ return normalizeHistory((await this._req('/api/history?range='+rangeMs)).data); }
+  async getSessions(limit=30){ return normalizeSessions((await this._req('/api/sessions?limit='+limit)).data); }
+}
+
+/* ---------- Simulated ESP32 (runs autonomously, like the real firmware) ---------- */
+class DemoDevice {
+  constructor(){
+    this.LIVE_EVAP = 0.05;                 // %/s of simulated drying
+    this.speed = 1; this.offline = false;
+    this.bootAt = Date.now() - 3*86400e3 - 4*3600e3;
+    this.reset(false);
+    setInterval(()=>this.advance(), 1000);
+  }
+  reset(clear=true){
+    if(clear){ store.del('demo.settings'); store.del('demo.mode'); }
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, store.get('demo.settings', {}) || {});
+    this.mode = store.get('demo.mode', null) || 'auto';
+    this.pump = false; this.session = null; this.sessions = []; this.history = [];
+    this.cooldownLeft = 0; this.lastStop = null; this.lastRec = 0; this.m = 58;
+    this.seed();
+  }
+  seed(){                                   // builds 24 h of realistic history using the same control logic
+    const end = Date.now(), keepMode = this.mode; this.mode = 'auto';
+    let t = end - 24*3600e3; this.m = 62; const sp = this.speed; this.speed = 1;
+    while(t < end){
+      const d = new Date(t), hr = d.getHours() + d.getMinutes()/60;
+      this.evap = 0.0012 + 0.0024*Math.max(0, Math.sin((hr-6)/12*Math.PI));
+      this.step(5, t);
+      if(t - this.lastRec >= ((end-t) > 15*60e3 ? 60e3 : 5e3)){ this.history.push({t, v:+this.m.toFixed(2)}); this.lastRec = t; }
+      t += 5000;
+    }
+    this.mode = keepMode; this.speed = sp; this.evap = this.LIVE_EVAP;
+    this.lastTick = Date.now(); this.lastRec = end;
+  }
+  startPump(trigger, now){
+    this.pump = true;
+    this.session = { id: now, startedAt: now, startMoisture: this.m, elapsedSec: 0, waterL: 0, trigger };
+  }
+  stopPump(reason, now){
+    const s = this.session; if(!s){ this.pump = false; return; }
+    this.sessions.push({ id:s.id, start:s.startedAt, end:now, durationSec:s.elapsedSec, startMoisture:s.startMoisture, endMoisture:this.m, waterL:s.waterL, trigger:s.trigger, reason });
+    if(this.sessions.length > 200) this.sessions.shift();
+    this.pump = false; this.session = null; this.lastStop = { reason, ts: now };
+    this.cooldownLeft = reason==='manual' ? 0 : this.settings.cooldownMin*60;
+  }
+  step(dt, now){                            // dt = simulated seconds
+    const s = this.settings;
+    if(this.cooldownLeft > 0) this.cooldownLeft = Math.max(0, this.cooldownLeft - dt);
+    if(this.pump){
+      this.session.elapsedSec += dt;
+      if(this.session.elapsedSec >= s.maxRunMin*60) this.stopPump('max_runtime', now);
+      else if(this.m >= 95) this.stopPump('overwater', now);
+      else if(this.mode==='auto' && this.m >= s.high) this.stopPump('target_reached', now);
+    } else if(this.mode==='auto' && this.m <= s.low && this.cooldownLeft <= 0){
+      this.startPump('auto', now);
+    }
+    if(this.pump){ this.m += 1.3*(1 - this.m/100)*dt; this.session.waterL += 0.025*dt; }
+    else this.m -= this.evap*dt;
+    this.m = clamp(this.m + (Math.random()-.5)*0.05*Math.sqrt(dt), 0, 100);
+  }
+  advance(){
+    const now = Date.now(); let sim = Math.min((now - this.lastTick)/1000, 600) * this.speed; this.lastTick = now;
+    while(sim > 0){ const d = Math.min(sim, 2); this.step(d, now); sim -= d; }
+    if(now - this.lastRec >= 5000){
+      this.history.push({ t:now, v:+this.m.toFixed(2) }); this.lastRec = now;
+      while(this.history.length && this.history[0].t < now - 25*3600e3) this.history.shift();
+    }
+  }
+  snapshot(){                               // identical shape to what the real firmware should return
+    const now = Date.now();
+    return {
+      ts: now, moisture: +this.m.toFixed(1), raw: Math.round(3200 - this.m*16.5), pump: this.pump, mode: this.mode,
+      cooldownRemainingSec: Math.ceil(this.cooldownLeft),
+      session: this.session ? { active:true, ...this.session } : { active:false },
+      lastStop: this.lastStop,
+      device: { ip:'192.168.1.42', rssi: -58 + Math.round(Math.sin(now/9000)*5), firmware:'v1.4.2-demo', uptimeSec:(now-this.bootAt)/1000 }
+    };
+  }
+}
+
+/* ---------- Demo adapter: same interface as HttpAdapter ---------- */
+class DemoAdapter {
+  constructor(){ this.device = new DemoDevice(); }
+  async _lag(){ const ms = 15 + Math.random()*35; await sleep(ms); if(this.device.offline) throw new ApiError('Device disconnected (simulated)'); return Math.round(ms); }
+  async getStatus(){ const l = await this._lag(); return normalizeStatus(this.device.snapshot(), l); }
+  async setPump(on){
+    await this._lag(); const d = this.device, now = Date.now();
+    if(on && !d.pump) d.startPump('manual', now); else if(!on && d.pump) d.stopPump('manual', now);
+    return this.getStatus();
+  }
+  async setMode(mode){ await this._lag(); this.device.mode = mode==='auto' ? 'auto' : 'manual'; store.set('demo.mode', this.device.mode); return this.getStatus(); }
+  async getSettings(){ await this._lag(); return { ...this.device.settings }; }
+  async saveSettings(s){
+    await this._lag(); const n = normalizeSettings(s);
+    if(n.high < n.low + 10) throw new ApiError('Stop level must be ≥ start level + 10');
+    this.device.settings = n; store.set('demo.settings', n); return { ...n };
+  }
+  async getHistory(rangeMs){ await this._lag(); const from = Date.now()-rangeMs; return this.device.history.filter(p=>p.t>=from).map(p=>({...p})); }
+  async getSessions(limit=30){ await this._lag(); return normalizeSessions(this.device.sessions.slice(-limit)); }
+}
+
+/* ---------- Facade used by the UI ---------- */
+const Api = {
+  adapter:null, demo:null,
+  use(mode){ if(mode==='live') this.adapter = new HttpAdapter(CONFIG); else { this.demo = this.demo || new DemoAdapter(); this.adapter = this.demo; } },
+  getStatus(){ return this.adapter.getStatus(); },
+  setPump(on){ return this.adapter.setPump(on); },
+  setMode(m){ return this.adapter.setMode(m); },
+  getSettings(){ return this.adapter.getSettings(); },
+  saveSettings(s){ return this.adapter.saveSettings(s); },
+  getHistory(r){ return this.adapter.getHistory(r); },
+  getSessions(n){ return this.adapter.getSessions(n); }
+};
+
+/* =======================================================================
+   3. STATE
+   ======================================================================= */
+const PREFS  = Object.assign({ theme:'system', accent:'green', motion:'on' }, store.get('prefs', {}));
+const CONFIG = Object.assign({ mode:'live', baseUrl:'', pollMs:1000 }, store.get('config', {}));
+const S = {
+  status:null, online:false, connecting:true, settings:{...DEFAULT_SETTINGS}, draft:{...DEFAULT_SETTINGS},
+  history:[], sessions:[], range:600000, view:'overview', lastOk:0, lastHist:0, fails:0, lastError:'',
+  pollToken:0, pollTimer:0, firstStatus:true, prevActive:false, lastStopTs:0, busy:false, loaded:false
+};
+const animOn = () => PREFS.motion !== 'off' && !reduceMotionMQ.matches;
+const zoneOf = (m, c) => m < c.low ? 'dry' : m > c.high ? 'wet' : 'optimal';
+
+/* =======================================================================
+   4. GAUGE (animated SVG arc)
+   ======================================================================= */
+const Gauge = {
+  C: 2*Math.PI*90, L: 0, disp: null, target: 0, raf: 0, last: 0, bandKey: '',
+  init(){ this.L = this.C*240/360; this.fill=$('#gFill'); this.knob=$('#gKnob'); this.val=$('#gVal'); this.band=$('#gBand'); this.paint(0); },
+  setBand(low, high){
+    const key = low+'-'+high; if(key===this.bandKey) return; this.bandKey = key;
+    const R=106, C2=2*Math.PI*R, L2=C2*240/360;
+    this.band.setAttribute('stroke-dasharray', `${L2*(high-low)/100} ${C2}`);
+    this.band.setAttribute('stroke-dashoffset', -(L2*low/100));
+  },
+  set(v){
+    this.target = v;
+    if(this.disp==null || !animOn()){ this.disp = v; this.paint(v); return; }
+    if(!this.raf){ this.last = performance.now(); this.raf = requestAnimationFrame(t=>this.tick(t)); }
+  },
+  tick(t){
+    const dt = Math.min(.1, (t-this.last)/1000); this.last = t;
+    this.disp += (this.target - this.disp) * Math.min(1, dt*5);
+    if(Math.abs(this.target-this.disp) < .02){ this.disp = this.target; this.raf = 0; this.paint(this.disp); return; }
+    this.paint(this.disp); this.raf = requestAnimationFrame(t=>this.tick(t));
+  },
+  paint(v){
+    const p = clamp(v,0,100)/100, a = (150+240*p)*Math.PI/180;
+    this.fill.setAttribute('stroke-dasharray', `${this.L*p} ${this.C}`);
+    this.knob.setAttribute('cx', 130+90*Math.cos(a)); this.knob.setAttribute('cy', 125+90*Math.sin(a));
+    this.val.textContent = S.status ? v.toFixed(1) : '--';
+  }
+};
+
+/* =======================================================================
+   5. TREND CHART (canvas)
+   ======================================================================= */
+function downsample(pts, t0, t1, n){
+  if(pts.length <= n*1.5) return pts;
+  const out = [], bw = (t1-t0)/n; let i = 0;
+  for(let b=0; b<n; b++){
+    const bs = t0+b*bw, be = bs+bw; let sum=0, c=0, ts=0;
+    while(i < pts.length && pts[i].t < be){ if(pts[i].t >= bs){ sum+=pts[i].v; ts+=pts[i].t; c++; } i++; }
+    if(c) out.push({ t:ts/c, v:sum/c });
+  }
+  const last = pts[pts.length-1]; if(out.length && out[out.length-1].t < last.t) out.push(last);
+  return out;
+}
+class TrendChart {
+  constructor(canvas, tip){
+    this.c = canvas; this.ctx = canvas.getContext('2d'); this.tip = tip; this.hover = null; this.view = null;
+    new ResizeObserver(()=>this.draw()).observe(canvas.parentElement);
+    const mv = e => this.onMove(e);
+    canvas.addEventListener('pointermove', mv); canvas.addEventListener('pointerdown', mv);
+    canvas.addEventListener('pointerleave', ()=>{ this.hover = null; this.tip.hidden = true; this.draw(); });
+  }
+  colors(){
+    const cs = getComputedStyle(document.documentElement), g = n => cs.getPropertyValue(n).trim();
+    return { accent:g('--accent'), muted:g('--muted'), border:g('--border'), water:g('--wet'), text:g('--text'), surface:g('--surface'), font:getComputedStyle(document.body).fontFamily };
+  }
+  bands(now){
+    const b = S.sessions.map(s => ({ a:s.start, b:s.end }));
+    if(S.status && S.status.session) b.push({ a:S.status.session.startedAt, b:now });
+    return b;
+  }
+  draw(){
+    const cv = this.c, w = cv.clientWidth, h = cv.clientHeight; if(!w || !h) return;
+    const dpr = window.devicePixelRatio || 1;
+    if(cv.width !== Math.round(w*dpr) || cv.height !== Math.round(h*dpr)){ cv.width = Math.round(w*dpr); cv.height = Math.round(h*dpr); }
+    const ctx = this.ctx; ctx.setTransform(dpr,0,0,dpr,0,0); ctx.clearRect(0,0,w,h);
+    const col = this.colors(), pad = { l:36, r:12, t:12, b:26 }, pw = w-pad.l-pad.r, ph = h-pad.t-pad.b;
+    const now = Date.now(), range = S.range, t0 = now-range;
+    const X = t => pad.l + (t-t0)/range*pw, Y = v => pad.t + (1-v/100)*ph, cfg = S.settings;
+    ctx.font = `600 11px ${col.font}`; ctx.textBaseline = 'middle';
+
+    // target band
+    ctx.fillStyle = hexA(col.accent, .12); ctx.fillRect(pad.l, Y(cfg.high), pw, Y(cfg.low)-Y(cfg.high));
+    // pump-on bands
+    for(const b of this.bands(now)){
+      const x1 = X(Math.max(b.a,t0)), x2 = X(Math.min(b.b,now)); if(x2 <= pad.l || x2 < x1) continue;
+      ctx.fillStyle = hexA(col.water, .16); ctx.fillRect(x1, pad.t, Math.max(2,x2-x1), ph);
+      ctx.fillStyle = hexA(col.water, .85); ctx.fillRect(x1, pad.t+ph-4, Math.max(2,x2-x1), 4);
+    }
+    // grid + y labels
+    ctx.textAlign = 'right'; ctx.lineWidth = 1;
+    for(const v of [0,25,50,75,100]){
+      ctx.strokeStyle = hexA(col.muted, v===0 ? .35 : .16); ctx.beginPath(); ctx.moveTo(pad.l, Y(v)+.5); ctx.lineTo(w-pad.r, Y(v)+.5); ctx.stroke();
+      ctx.fillStyle = col.muted; ctx.fillText(v+'%', pad.l-7, Y(v));
+    }
+    // thresholds
+    ctx.setLineDash([5,4]); ctx.strokeStyle = hexA(col.accent, .7); ctx.lineWidth = 1.2;
+    for(const v of [cfg.low, cfg.high]){ ctx.beginPath(); ctx.moveTo(pad.l, Y(v)); ctx.lineTo(w-pad.r, Y(v)); ctx.stroke(); }
+    ctx.setLineDash([]);
+    // x ticks
+    const target = Math.max(3, Math.floor(pw/95)), ideal = range/target;
+    const steps = [1,2,5,10,15,30,60,120,180,360,720].map(m=>m*60000), step = steps.find(s=>s>=ideal) || steps[steps.length-1];
+    const off = new Date().getTimezoneOffset()*60000; ctx.textAlign = 'center';
+    for(let t = Math.ceil((t0-off)/step)*step+off; t <= now; t += step){
+      const x = X(t); if(x < pad.l+14 || x > w-pad.r-14) continue;
+      ctx.strokeStyle = hexA(col.muted, .12); ctx.beginPath(); ctx.moveTo(x+.5, pad.t); ctx.lineTo(x+.5, pad.t+ph); ctx.stroke();
+      ctx.fillStyle = col.muted; ctx.fillText(fmtTime(t), x, h-10);
+    }
+    // line + area
+    let pts = S.history.filter(p => p.t >= t0 - range*0.03);
+    pts = downsample(pts, t0, now, Math.max(40, Math.floor(pw/2.5)));
+    const vis = pts.map(p => ({ x:X(p.t), y:Y(p.v), t:p.t, v:p.v })); this.view = { pad, vis, t0, w, h, ph, bands:this.bands(now) };
+    if(vis.length > 1){
+      ctx.beginPath(); vis.forEach((p,i) => i ? ctx.lineTo(p.x,p.y) : ctx.moveTo(p.x,p.y));
+      const g = ctx.createLinearGradient(0, pad.t, 0, pad.t+ph); g.addColorStop(0, hexA(col.accent,.32)); g.addColorStop(1, hexA(col.accent,0));
+      ctx.save(); ctx.lineTo(vis[vis.length-1].x, pad.t+ph); ctx.lineTo(vis[0].x, pad.t+ph); ctx.closePath(); ctx.fillStyle = g; ctx.fill(); ctx.restore();
+      ctx.beginPath(); vis.forEach((p,i) => i ? ctx.lineTo(p.x,p.y) : ctx.moveTo(p.x,p.y));
+      ctx.lineWidth = 2.6; ctx.lineJoin = 'round'; ctx.lineCap = 'round'; ctx.strokeStyle = col.accent; ctx.stroke();
+      const l = vis[vis.length-1];
+      ctx.fillStyle = hexA(col.accent,.25); ctx.beginPath(); ctx.arc(l.x,l.y,8,0,7); ctx.fill();
+      ctx.fillStyle = col.accent; ctx.strokeStyle = col.surface; ctx.lineWidth = 2.5; ctx.beginPath(); ctx.arc(l.x,l.y,4.5,0,7); ctx.fill(); ctx.stroke();
+    } else if(!vis.length){
+      ctx.fillStyle = col.muted; ctx.textAlign = 'center'; ctx.font = `600 13px ${col.font}`; ctx.fillText('No data for this range yet', pad.l+pw/2, pad.t+ph/2);
+    }
+    // hover
+    if(this.hover){
+      const p = this.hover;
+      ctx.strokeStyle = hexA(col.text,.35); ctx.lineWidth = 1; ctx.setLineDash([3,3]); ctx.beginPath(); ctx.moveTo(p.x+.5, pad.t); ctx.lineTo(p.x+.5, pad.t+ph); ctx.stroke(); ctx.setLineDash([]);
+      ctx.fillStyle = col.surface; ctx.strokeStyle = col.accent; ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(p.x,p.y,5.5,0,7); ctx.fill(); ctx.stroke();
+    }
+  }
+  onMove(e){
+    if(!this.view || !this.view.vis.length) return;
+    const r = this.c.getBoundingClientRect(), x = e.clientX - r.left, vis = this.view.vis;
+    let lo = 0, hi = vis.length-1;
+    while(hi-lo > 1){ const mid = (lo+hi)>>1; (vis[mid].x < x) ? lo = mid : hi = mid; }
+    const p = Math.abs(vis[lo].x-x) < Math.abs(vis[hi].x-x) ? vis[lo] : vis[hi];
+    if(Math.abs(p.x-x) > 40){ this.hover = null; this.tip.hidden = true; this.draw(); return; }
+    this.hover = p; const pumping = this.view.bands.some(b => p.t >= b.a && p.t <= b.b);
+    this.tip.hidden = false;
+    this.tip.innerHTML = `<b>${p.v.toFixed(1)}%</b><br>${fmtTime(p.t)}${pumping ? ' · 💧 pump on' : ''}`;
+    const tw = this.tip.offsetWidth/2 + 4;
+    this.tip.style.left = clamp(p.x, tw, this.view.w - tw) + 'px'; this.tip.style.top = Math.max(34, p.y - 12) + 'px';
+    this.draw();
+  }
+}
+
+/* =======================================================================
+   6. UI RENDERING
+   ======================================================================= */
+let chart, lastHistRender = 0;
+const ago = ts => { const s = Math.round((Date.now()-ts)/1000); return s < 2 ? 'just now' : s < 60 ? s+'s ago' : Math.round(s/60)+' min ago'; };
+const setZone = (a,b,c,low,high) => { a.style.flexBasis = low+'%'; b.style.flexBasis = (high-low)+'%'; c.style.flexBasis = (100-high)+'%'; };
+const paintRange = el => { const p = (el.value-el.min)/(el.max-el.min)*100; el.style.setProperty('--p', p+'%'); };
+
+function toast(msg, type='info', ms=3800){
+  const icon = { ok:'check', warn:'alert', error:'alert', info:'drop' }[type];
+  const el = document.createElement('div'); el.className = 'toast '+type;
+  el.innerHTML = `<svg class="ico"><use href="#i-${icon}"/></svg><span></span>`; el.lastChild.textContent = msg;
+  $('#toasts').append(el); if($('#toasts').children.length > 3) $('#toasts').firstChild.remove();
+  setTimeout(()=>{ el.classList.add('out'); setTimeout(()=>el.remove(), 320); }, ms);
+}
+
+function renderConn(){
+  const state = S.online ? 'online' : S.connecting ? 'connecting' : 'offline';
+  $('#conn').dataset.state = state;
+  $('#connText').textContent = { online:'Connected', connecting:'Connecting…', offline:'Offline' }[state];
+  $('#connLat').textContent = S.online && S.status ? `· ${S.status.latency} ms` : '';
+  const showBanner = state === 'offline';
+  $('#offlineBanner').hidden = !showBanner;
+  if(showBanner) $('#offlineMsg').textContent = (CONFIG.mode==='demo' ? 'The simulated device is disconnected.' : `Can't reach ${CONFIG.baseUrl || 'the ESP32'} (${S.lastError||'no response'}). Retrying…`) + ' Showing last known data; controls are disabled.';
+  const dis = !S.online;
+  $('#pumpSwitch').setAttribute('aria-disabled', dis);
+  $$('#modeSeg button').forEach(b => b.disabled = dis);
+}
+
+function renderMeta(){
+  $('#updated').textContent = S.lastOk ? 'Updated ' + ago(S.lastOk) : 'Waiting for data…';
+  if(S.status && !S.online) $('#dStatus').textContent = 'Offline';
+}
+
+function rate(){
+  const h = S.history; if(h.length < 3) return null;
+  const last = h[h.length-1]; let i = h.length-2; while(i > 0 && last.t - h[i].t < 60000) i--;
+  const dm = (last.t-h[i].t)/60000; return dm < .25 ? null : (last.v-h[i].v)/dm;
+}
+
+function renderMoisture(st, cfg){
+  const m = st.moisture, z = zoneOf(m, cfg);
+  $('#moistureCard').dataset.zone = z;
+  Gauge.set(m); Gauge.setBand(cfg.low, cfg.high);
+  $$('#chips .chip').forEach(c => c.dataset.on = (c.dataset.z === z));
+  setZone($('#zbDry'), $('#zbOpt'), $('#zbWet'), cfg.low, cfg.high);
+  $('#tickLow').style.left = cfg.low+'%'; $('#tickLow').textContent = cfg.low;
+  $('#tickHigh').style.left = cfg.high+'%'; $('#tickHigh').textContent = cfg.high;
+  $('#zbMarker').style.left = clamp(m,0,100)+'%';
+  const C = {
+    dry:{ i:'alert', t:'Soil is dry', d:`Below the ${cfg.low}% start threshold.` + (st.mode==='auto' ? ' Automatic watering will begin.' : ' Consider turning the pump on.') },
+    optimal:{ i:'check', t:'Moisture is optimal', d:`Within your ${cfg.low}–${cfg.high}% target range.` },
+    wet:{ i:'drop', t:'Soil is wet', d:`Above ${cfg.high}% — no watering needed.` }
+  }[z];
+  if(st.pump) Object.assign(C, { i:'pump', t:'Watering in progress', d:`Moisture is rising toward ${cfg.high}%.` });
+  $('#condIco').innerHTML = `<use href="#i-${C.i}"/>`; $('#condTitle').textContent = C.t; $('#condText').textContent = C.d;
+  const r = rate(), t = $('#trend');
+  if(r == null){ t.className = ''; t.textContent = 'Collecting trend…'; }
+  else if(r > .3){ t.className = 'up'; t.textContent = `▲ +${r.toFixed(1)} %/min · Rising`; }
+  else if(r < -.3){ t.className = 'down'; t.textContent = `▼ ${r.toFixed(1)} %/min · Falling`; }
+  else { t.className = ''; t.textContent = '● Steady'; }
+}
+
+function renderPump(st, cfg){
+  const sw = $('#pumpSwitch'), on = st.pump;
+  sw.setAttribute('aria-checked', on); $('#pumpStage').classList.toggle('on', on);
+  $('#pumpState').textContent = on ? 'Pump is running' : 'Pump is off';
+  $('#pumpSub').textContent = on && st.session ? `${fmtDur(st.session.elapsedSec)} elapsed · ${st.session.waterL.toFixed(2)} L delivered`
+    : st.mode === 'auto' ? 'Standing by — waiting for soil to dry out' : 'Ready — tap the switch to start watering';
+  $$('#modeSeg button').forEach(b => b.setAttribute('aria-checked', b.dataset.mode === st.mode));
+  $('#modeHint').textContent = st.mode === 'auto'
+    ? `Automatic: starts below ${cfg.low}%, stops at ${cfg.high}% or after ${cfg.maxRunMin} min.`
+    : `Manual: you control the pump. Safety cut-off after ${cfg.maxRunMin} min.`;
+}
+
+function renderProcess(st, cfg){
+  const ses = st.session, ls = st.lastStop, recent = !!(ls && !ses && st.ts - ls.ts < 45000);
+  const safety = recent && (ls.reason === 'max_runtime' || ls.reason === 'overwater');
+  let phase = 'idle', label = 'Idle';
+  if(ses){ phase = 'watering'; label = 'Watering'; }
+  else if(safety){ phase = 'cutoff'; label = 'Safety stop'; }
+  else if(st.mode === 'auto' && st.cooldownRemainingSec > 0){ phase = 'cooldown'; label = 'Cooldown'; }
+  const ph = $('#phase'); ph.dataset.phase = phase; ph.textContent = label;
+
+  // stepper
+  const lis = $$('#steps li'); let states = ['','','',''];
+  if(ses) states = ['done','done','active',''];
+  else if(recent) states = ['done','done','done', safety ? 'warn' : 'done'];
+  lis.forEach((li,i) => li.className = states[i]);
+  lis[0].querySelector('.s-label').textContent = ses ? (ses.trigger === 'auto' ? 'Dry detected' : 'Manual start') : 'Soil check';
+  lis[3].querySelector('.s-label').textContent = safety ? 'Safety stop' : recent && ls.reason === 'manual' ? 'Stopped' : 'Complete';
+
+  // progress
+  let pct = 0;
+  if(ses){ const span = cfg.high - ses.startMoisture; pct = span <= 0 ? 100 : clamp((st.moisture - ses.startMoisture)/span*100, 0, 100); }
+  else if(recent && !safety && ls.reason === 'target_reached') pct = 100;
+  $('#progLabel').textContent = `Progress to target (${cfg.high}%)`; $('#progPct').textContent = Math.round(pct)+'%';
+  $('#barFill').style.width = pct+'%'; $('#bar').classList.toggle('live', !!ses); $('#bar').setAttribute('aria-valuenow', Math.round(pct));
+
+  // stats
+  const last = S.sessions[0];
+  if(ses){
+    const gain = st.moisture - ses.startMoisture, rt = ses.elapsedSec > 6 ? gain/ses.elapsedSec : 0;
+    const eta = rt > .02 && st.moisture < cfg.high ? (cfg.high - st.moisture)/rt : null;
+    $('#statCap').textContent = 'Current session';
+    $('#stDur').textContent = fmtDur(ses.elapsedSec); $('#stDurS').textContent = `max ${fmtDur(cfg.maxRunMin*60)}`;
+    $('#stWater').textContent = ses.waterL.toFixed(2)+' L'; $('#stWaterS').textContent = `≈ ${(ses.waterL/Math.max(ses.elapsedSec,1)*60).toFixed(1)} L/min`;
+    $('#stGain').textContent = (gain>=0?'+':'')+gain.toFixed(1)+'%'; $('#stGainS').textContent = `from ${ses.startMoisture.toFixed(1)}%`;
+    $('#stEtaK').textContent = 'Time to target'; $('#stEta').textContent = eta != null ? '~'+fmtDur(eta) : '—'; $('#stEtaS').textContent = `to reach ${cfg.high}%`;
+  } else if(last){
+    const gain = last.endMoisture - last.startMoisture;
+    $('#statCap').textContent = 'Last session';
+    $('#stDur').textContent = fmtDur(last.durationSec); $('#stDurS').textContent = last.trigger === 'auto' ? 'automatic' : 'manual';
+    $('#stWater').textContent = last.waterL.toFixed(2)+' L'; $('#stWaterS').textContent = 'delivered';
+    $('#stGain').textContent = (gain>=0?'+':'')+gain.toFixed(1)+'%'; $('#stGainS').textContent = `${last.startMoisture.toFixed(0)}% → ${last.endMoisture.toFixed(0)}%`;
+    $('#stEtaK').textContent = 'Finished'; $('#stEta').textContent = fmtTime(last.end); $('#stEtaS').textContent = ago(last.end);
+  } else {
+    $('#statCap').textContent = 'No sessions yet';
+    ['stDur','stWater','stGain','stEta'].forEach(id => $('#'+id).textContent = '—');
+    ['stDurS','stWaterS','stGainS','stEtaS'].forEach(id => $('#'+id).innerHTML = '&nbsp;');
+  }
+
+  // note
+  let note;
+  if(ses) note = ses.trigger === 'auto' ? `Automatic cycle running. It will stop at ${cfg.high}% or after ${cfg.maxRunMin} min.` : 'Manual watering. Turn the pump off at any time.';
+  else if(safety) note = ls.reason === 'max_runtime' ? 'The pump was stopped by the max-run-time safety limit.' : 'The pump was stopped by overflow protection (soil nearly saturated).';
+  else if(st.mode === 'auto' && st.cooldownRemainingSec > 0) note = `Cool-down active — next automatic check in ${fmtDur(st.cooldownRemainingSec)}.`;
+  else if(st.mode === 'auto'){ const gap = st.moisture - cfg.low; note = gap <= 0 ? 'Below the start threshold — starting shortly.' : `Automatic mode armed — starts below ${cfg.low}% (${gap.toFixed(1)} points to go).`; }
+  else note = 'Manual mode — the pump runs only when you switch it on.';
+  $('#procNote').textContent = note;
+}
+
+function renderDevice(st){
+  $('#dStatus').textContent = S.online ? 'Online' : 'Offline';
+  const r = st.device.rssi, lv = r > -55 ? 4 : r > -65 ? 3 : r > -75 ? 2 : 1;
+  $$('#dSig i').forEach((b,i) => b.dataset.on = i < lv);
+  $('#dRssi').textContent = r+' dBm'; $('#dLat').textContent = st.latency+' ms';
+  $('#dIp').textContent = st.device.ip; $('#dUp').textContent = fmtDur(st.device.uptimeSec);
+  $('#dRaw').textContent = st.raw != null ? st.raw : '—'; $('#dFw').textContent = st.device.firmware;
+}
+
+function renderRangeStats(){
+  const from = Date.now() - S.range, v = S.history.filter(p => p.t >= from).map(p => p.v);
+  const f = x => x.toFixed(1)+'%';
+  $('#rMin').textContent = v.length ? f(Math.min(...v)) : '—';
+  $('#rMax').textContent = v.length ? f(Math.max(...v)) : '—';
+  $('#rAvg').textContent = v.length ? f(v.reduce((a,b)=>a+b,0)/v.length) : '—';
+}
+
+function renderHistoryView(){
+  const now = Date.now(), from = now - 24*3600e3, cfg = S.settings;
+  const pts = S.history.filter(p => p.t >= from), ses = S.sessions.filter(s => s.end >= from);
+  const vals = pts.map(p => p.v), f = x => x.toFixed(1)+'%';
+  $('#hSessions').textContent = ses.length;
+  $('#hWater').textContent = ses.reduce((a,s)=>a+s.waterL,0).toFixed(1)+' L';
+  $('#hRun').textContent = fmtDur(ses.reduce((a,s)=>a+s.durationSec,0));
+  $('#hAvg').textContent = vals.length ? f(vals.reduce((a,b)=>a+b,0)/vals.length) : '—';
+  $('#hMin').textContent = vals.length ? f(Math.min(...vals)) : '—';
+  $('#hMax').textContent = vals.length ? f(Math.max(...vals)) : '—';
+
+  // hourly bars
+  const sums = Array.from({length:24}, () => ({s:0,c:0}));
+  for(const p of pts){ const i = clamp(Math.floor((p.t-from)/3600e3), 0, 23); sums[i].s += p.v; sums[i].c++; }
+  const hb = $('#hbars'); hb.innerHTML = '';
+  sums.forEach((b,i) => {
+    const avg = b.c ? b.s/b.c : 0, d = document.createElement('div'); d.className = 'hb';
+    d.dataset.z = b.c ? zoneOf(avg, cfg) : ''; d.title = `${fmtTime(from+i*3600e3)} · ${b.c ? avg.toFixed(1)+'%' : 'no data'}`;
+    d.innerHTML = '<span></span>'; hb.append(d); requestAnimationFrame(()=>{ d.firstChild.style.height = avg+'%'; });
+  });
+  $('#hlabels').innerHTML = [0,6,12,18,23].map(i => `<span>${fmtTime(from+i*3600e3)}</span>`).join('');
+
+  // log
+  const log = $('#log'); log.innerHTML = '';
+  $('#logCount').textContent = S.sessions.length ? `${S.sessions.length} recent` : '';
+  if(!S.sessions.length){ log.innerHTML = '<li class="empty" style="display:block">No irrigation sessions recorded yet.</li>'; return; }
+  S.sessions.slice(0,25).forEach(s => {
+    const li = document.createElement('li'), tag = s.reason === 'max_runtime' ? '<em class="tag">Max run time</em>' : s.reason === 'overwater' ? '<em class="tag">Overflow guard</em>' : '';
+    li.innerHTML = `<span class="log-ico ${s.trigger}"><svg class="ico"><use href="#i-${s.trigger==='auto'?'auto':'hand'}"/></svg></span>
+      <div class="log-main"><strong>${s.trigger==='auto'?'Automatic':'Manual'} irrigation</strong><span>${fmtDay(s.start)} · ${fmtDur(s.durationSec)} · ${s.waterL.toFixed(2)} L</span></div>
+      <div class="log-end"><b>${Math.round(s.startMoisture)}% → ${Math.round(s.endMoisture)}%</b>${tag}</div>`;
+    log.append(li);
+  });
+}
+
+function syncSettingsUI(){
+  const d = S.draft;
+  const map = [['sLow','oLow',d.low,'%'],['sHigh','oHigh',d.high,'%'],['sMax','oMax',d.maxRunMin,' min'],['sCool','oCool',d.cooldownMin,' min']];
+  for(const [id,out,val,unit] of map){ const el = $('#'+id); el.value = val; paintRange(el); $('#'+out).textContent = val+unit; }
+  setZone($('#pvDry'), $('#pvOpt'), $('#pvWet'), d.low, d.high);
+  const dirty = JSON.stringify(d) !== JSON.stringify(S.settings);
+  $('#dirty').classList.toggle('on', dirty);
+  $('#saveSettings').disabled = !dirty || !S.online; $('#resetSettings').disabled = !dirty;
+}
+
+function syncPrefsUI(){
+  $$('#themeSeg button').forEach(b => b.setAttribute('aria-checked', b.dataset.themePref === PREFS.theme));
+  $$('#swatches .swatch').forEach(b => b.setAttribute('aria-checked', b.dataset.accent === PREFS.accent));
+  $$('#motionSeg button').forEach(b => b.setAttribute('aria-checked', b.dataset.motion === PREFS.motion));
+  $$('#srcSeg button').forEach(b => b.setAttribute('aria-checked', b.dataset.src === CONFIG.mode));
+  $('#baseUrl').value = CONFIG.baseUrl; $('#baseUrl').disabled = CONFIG.mode === 'demo'; $('#pollSel').value = String(CONFIG.pollMs);
+  $('#demoTools').hidden = CONFIG.mode !== 'demo';
+  const dev = Api.demo && Api.demo.device;
+  if(dev){ $$('#speedSeg button').forEach(b => b.setAttribute('aria-checked', +b.dataset.speed === dev.speed)); $('#dropBtn').textContent = dev.offline ? 'Reconnect device' : 'Simulate disconnect'; }
+}
+
+function render(){
+  renderConn(); renderMeta();
+  const st = S.status;
+  if(!st){ renderRangeStats(); chart && chart.draw(); return; }
+  const cfg = S.settings;
+  renderMoisture(st, cfg); renderPump(st, cfg); renderProcess(st, cfg); renderDevice(st); renderRangeStats();
+  chart.draw();
+  if(S.view === 'history' && Date.now() - lastHistRender > 10000){ lastHistRender = Date.now(); renderHistoryView(); }
+}
+
+/* =======================================================================
+   7. DATA FLOW (polling + commands)
+   ======================================================================= */
+async function loadData(){
+  try{
+    S.settings = await Api.getSettings(); S.draft = { ...S.settings };
+    S.history = await Api.getHistory(24*3600e3); S.lastHist = S.history.length ? S.history[S.history.length-1].t : 0;
+    S.sessions = await Api.getSessions(30); S.loaded = true;
+  }catch(e){ S.loaded = false; }
+  syncSettingsUI(); renderHistoryView(); render();
+}
+
+async function refreshSessions(){ try{ S.sessions = await Api.getSessions(30); }catch(e){} if(S.view==='history') renderHistoryView(); }
+
+function onStatus(st){
+  const first = S.firstStatus; S.firstStatus = false;
+  S.status = st; S.online = true; S.connecting = false; S.fails = 0; S.lastOk = Date.now();
+  if(!S.loaded) loadData();
+  if(st.ts - S.lastHist >= 5000){
+    S.history.push({ t:st.ts, v:st.moisture }); S.lastHist = st.ts;
+    while(S.history.length && S.history[0].t < st.ts - 25*3600e3) S.history.shift();
+  }
+  const active = !!st.session;
+  if(!first){
+    if(active && !S.prevActive && st.session.trigger === 'auto') toast(`Automatic irrigation started — soil at ${st.moisture.toFixed(0)}%`, 'info');
+    if(!active && S.prevActive){
+      const ls = st.lastStop;
+      if(ls && ls.reason === 'target_reached') toast(`Irrigation complete — target ${S.settings.high}% reached`, 'ok');
+      else if(ls && ls.reason === 'max_runtime') toast('Pump stopped: maximum run time reached', 'warn');
+      else if(ls && ls.reason === 'overwater') toast('Pump stopped: overflow protection triggered', 'warn');
+      refreshSessions();
+    }
+  }
+  S.prevActive = active;
+  render();
+}
+function onFail(e){
+  S.fails++; S.lastError = e.message;
+  if(S.fails >= 2 || !S.status){ S.online = false; S.connecting = false; }
+  render(); syncSettingsUI();
+}
+async function poll(token){
+  if(token !== S.pollToken) return;
+  try{ const st = await Api.getStatus(); if(token !== S.pollToken) return; const was = S.online; onStatus(st); if(!was) syncSettingsUI(); }
+  catch(e){ if(token !== S.pollToken) return; onFail(e); }
+  S.pollTimer = setTimeout(()=>poll(token), S.online ? CONFIG.pollMs : clamp(CONFIG.pollMs*2, 2000, 4000));
+}
+async function startApp(){
+  S.pollToken++; clearTimeout(S.pollTimer);
+  Api.use(CONFIG.mode);
+  Object.assign(S, { status:null, online:false, connecting:true, history:[], sessions:[], fails:0, firstStatus:true, prevActive:false, loaded:false, lastOk:0, lastHist:0 });
+  $('#demoBadge').hidden = CONFIG.mode !== 'demo'; document.title = 'GreenDrip · ' + (CONFIG.mode==='demo' ? 'Demo' : 'Live');
+  syncPrefsUI(); render();
+  loadData(); poll(S.pollToken);
+}
+
+async function command(fn, okMsg){
+  if(!S.online || S.busy) return;
+  S.busy = true; $('#pumpSwitch').setAttribute('aria-busy','true');
+  try{ const st = await fn(); if(st) onStatus(st); if(okMsg) toast(okMsg.text, okMsg.type); }
+  catch(e){ toast('Command failed: ' + e.message, 'error'); }
+  finally{ S.busy = false; $('#pumpSwitch').removeAttribute('aria-busy'); }
+}
+function togglePump(){
+  if(!S.online){ toast('Device is offline — controls are disabled', 'warn'); return; }
+  const st = S.status, next = !st.pump;
+  command(async () => {
+    if(st.mode === 'auto'){ await Api.setMode('manual'); toast('Switched to Manual mode to take control of the pump', 'info'); }
+    return Api.setPump(next);
+  }, { text: next ? 'Pump started' : 'Pump stopped', type: next ? 'ok' : 'info' });
+}
+
+/* =======================================================================
+   8. NAVIGATION, THEME & EVENT WIRING
+   ======================================================================= */
+function setView(v){
+  S.view = v;
+  $$('.view').forEach(el => el.hidden = el.id !== 'view-' + v);
+  $$('#nav button').forEach(b => b.setAttribute('aria-current', b.dataset.view === v ? 'page' : 'false'));
+  if(v === 'history'){ lastHistRender = Date.now(); renderHistoryView(); }
+  if(v === 'settings'){ syncSettingsUI(); syncPrefsUI(); }
+  if(v === 'overview') requestAnimationFrame(()=>chart.draw());
+  window.scrollTo({ top:0, behavior: animOn() ? 'smooth' : 'auto' });
+}
+
+const darkMQ = matchMedia('(prefers-color-scheme: dark)');
+function applyPrefs(){
+  const dark = PREFS.theme === 'dark' || (PREFS.theme === 'system' && darkMQ.matches);
+  const root = document.documentElement;
+  root.dataset.theme = dark ? 'dark' : 'light'; root.dataset.accent = PREFS.accent;
+  if(PREFS.motion === 'off') root.dataset.motion = 'off'; else delete root.dataset.motion;
+  const meta = $('meta[name=theme-color]'); requestAnimationFrame(()=>{ meta.content = getComputedStyle(root).getPropertyValue('--accent').trim(); chart && chart.draw(); });
+  syncPrefsUI();
+}
+const savePrefs = () => { store.set('prefs', PREFS); applyPrefs(); };
+darkMQ.addEventListener('change', () => { if(PREFS.theme === 'system') applyPrefs(); });
+
+function wire(){
+  $('#nav').addEventListener('click', e => { const b = e.target.closest('button[data-view]'); if(b) setView(b.dataset.view); });
+  $('#themeBtn').addEventListener('click', () => { PREFS.theme = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark'; savePrefs(); });
+  $('#pumpSwitch').addEventListener('click', togglePump);
+  $('#modeSeg').addEventListener('click', e => {
+    const b = e.target.closest('button[data-mode]'); if(!b || !S.status || b.dataset.mode === S.status.mode) return;
+    command(() => Api.setMode(b.dataset.mode), { text: b.dataset.mode === 'auto' ? 'Automatic mode enabled' : 'Manual mode enabled', type: 'ok' });
+  });
+  $('#rangeSeg').addEventListener('click', e => {
+    const b = e.target.closest('button[data-range]'); if(!b) return;
+    S.range = +b.dataset.range; $$('#rangeSeg button').forEach(x => x.setAttribute('aria-checked', x === b)); chart.hover = null; $('#tip').hidden = true; renderRangeStats(); chart.draw();
+  });
+
+  // thresholds
+  const edit = () => { syncSettingsUI(); };
+  $('#sLow').addEventListener('input', e => { S.draft.low = +e.target.value; if(S.draft.high < S.draft.low+10) S.draft.high = S.draft.low+10; edit(); });
+  $('#sHigh').addEventListener('input', e => { S.draft.high = +e.target.value; if(S.draft.low > S.draft.high-10) S.draft.low = S.draft.high-10; edit(); });
+  $('#sMax').addEventListener('input', e => { S.draft.maxRunMin = +e.target.value; edit(); });
+  $('#sCool').addEventListener('input', e => { S.draft.cooldownMin = +e.target.value; edit(); });
+  $('#resetSettings').addEventListener('click', () => { S.draft = { ...S.settings }; syncSettingsUI(); });
+  $('#saveSettings').addEventListener('click', async () => {
+    const btn = $('#saveSettings'); btn.disabled = true;
+    try{ S.settings = await Api.saveSettings(S.draft); S.draft = { ...S.settings }; toast('Thresholds saved to device', 'ok'); render(); renderHistoryView(); }
+    catch(e){ toast('Could not save: ' + e.message, 'error'); }
+    syncSettingsUI();
+  });
+
+  // appearance
+  $('#themeSeg').addEventListener('click', e => { const b = e.target.closest('button'); if(b){ PREFS.theme = b.dataset.themePref; savePrefs(); } });
+  $('#swatches').addEventListener('click', e => { const b = e.target.closest('.swatch'); if(b){ PREFS.accent = b.dataset.accent; savePrefs(); } });
+  $('#motionSeg').addEventListener('click', e => { const b = e.target.closest('button'); if(b){ PREFS.motion = b.dataset.motion; savePrefs(); } });
+
+  // connection
+  $('#srcSeg').addEventListener('click', e => { const b = e.target.closest('button'); if(!b) return; CONFIG.mode = b.dataset.src; syncPrefsUI(); });
+  $('#applyConn').addEventListener('click', () => {
+    CONFIG.baseUrl = $('#baseUrl').value.trim(); CONFIG.pollMs = +$('#pollSel').value; store.set('config', CONFIG);
+    toast(CONFIG.mode === 'demo' ? 'Using demo mode' : `Connecting to ${CONFIG.baseUrl || 'this ESP32'}…`, 'info'); startApp();
+  });
+  $('#testConn').addEventListener('click', async () => {
+    const url = $('#baseUrl').value.trim();
+    if(CONFIG.mode === 'demo'){ toast('Demo mode is always available', 'ok'); return; }
+    try{ const st = await new HttpAdapter({ baseUrl:url }).getStatus(); toast(`Device responded in ${st.latency} ms (moisture ${st.moisture.toFixed(0)}%)`, 'ok'); }
+    catch(e){ toast('Test failed: ' + e.message, 'error'); }
+  });
+
+  // demo tools
+  const dev = () => Api.demo && Api.demo.device;
+  $('#speedSeg').addEventListener('click', e => { const b = e.target.closest('button'); if(b && dev()){ dev().speed = +b.dataset.speed; syncPrefsUI(); toast(`Simulation speed ${b.dataset.speed}×`, 'info'); } });
+  $('#dryBtn').addEventListener('click', () => { const d = dev(); if(!d) return; d.m = Math.max(5, Math.min(d.m, d.settings.low + 4)); toast('Soil moisture lowered — watch automatic mode react', 'info'); });
+  $('#dropBtn').addEventListener('click', () => { const d = dev(); if(!d) return; d.offline = !d.offline; syncPrefsUI(); toast(d.offline ? 'Device disconnected (simulated)' : 'Device reconnected', d.offline ? 'warn' : 'ok'); });
+  $('#resetDemo').addEventListener('click', () => { const d = dev(); if(!d) return; d.offline = false; d.reset(true); toast('Demo data reset', 'ok'); startApp(); });
+
+  $('#exportBtn').addEventListener('click', () => {
+    if(!S.history.length){ toast('No history to export yet', 'warn'); return; }
+    const rows = ['timestamp_iso,moisture_percent', ...S.history.map(p => `${new Date(p.t).toISOString()},${p.v}`)];
+    const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([rows.join('\n')], { type:'text/csv' })); a.download = 'moisture-history.csv';
+    document.body.append(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  });
+
+  document.addEventListener('visibilitychange', () => { if(!document.hidden){ render(); } });
+  setInterval(() => { renderMeta(); }, 1000);
+}
+
+/* =======================================================================
+   9. BOOT
+   ======================================================================= */
+Gauge.init();
+chart = new TrendChart($('#chart'), $('#tip'));
+wire(); applyPrefs();
+if(location.hash === '#history' || location.hash === '#settings') setView(location.hash.slice(1));
+startApp();
+</script>
+</body>
+</html>
+)rawliteral";
+
+void handleRoot() {
+  server.sendHeader("Cache-Control", "no-cache");
+  server.send_P(200, "text/html; charset=utf-8", INDEX_HTML);
+}
